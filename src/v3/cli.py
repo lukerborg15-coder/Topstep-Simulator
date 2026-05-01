@@ -12,6 +12,7 @@ from .audit_stamp import write_audit_stamp
 from .combine_simulator import run_combine_simulator
 from .config import (
     DEFAULT_DATA_DIR,
+    DEFAULT_FUNDED_EXPRESS_SIM,
     DEFAULT_MAX_CONTRACTS,
     DEFAULT_MIN_FOLD_SEQ_PASS_RATE_PCT,
     DEFAULT_RISK_DOLLARS,
@@ -32,6 +33,8 @@ from .evaluator import (
     wf_oos_folds_for_selected_params,
 )
 from .freeze import freeze_params
+from .funded_express_sim import express_funded_reset_sim_summary_dict, simulate_express_funded_resets
+from .json_readable import write_readable_text_from_json_file
 from .holdout_monte_carlo import holdout_monte_carlo_summary_dict, run_holdout_trade_monte_carlo
 from .pipeline_config import resolve_windows
 from .sensitivity import (
@@ -82,7 +85,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--topstep-weight", type=float, default=1.0, help="Weight for Topstep score in walk-forward selection (default 1.0)")
     parser.add_argument("--avg-r-weight", type=float, default=25.0, help="Weight for avg_r in walk-forward selection (default 25.0)")
     parser.add_argument("--data-dir", default=str(DEFAULT_DATA_DIR), help="Directory containing MNQ_* CSV bundles.")
-    parser.add_argument("--output-dir", default=str(OUTPUT_DIR), help="Writes result JSON here.")
+    parser.add_argument("--output-dir", default=str(OUTPUT_DIR), help="Run output root (JSON→json/, text summaries→txt summaries/, frozen→frozen_params/).")
     parser.add_argument("--frozen-params-dir", default=None, help="Overrides output-dir/frozen_params as the freeze and audit stamp directory.")
     parser.add_argument("--list-strategies", action="store_true", help="List registered strategies and exit.")
     parser.add_argument("--skip-wf", action="store_true", help="Skip walk-forward optimization; evaluate holdout using default_params.")
@@ -452,6 +455,27 @@ def main(argv: list[str] | None = None) -> int:
         f"holdout net_pnl={float(holdout_eval.metrics['total_net_pnl']):.2f} "
         f"max_dd={float(holdout_eval.metrics['max_drawdown']):.2f}",
     )
+    ho_express_sim = simulate_express_funded_resets(
+        holdout_eval.trades,
+        rules=DEFAULT_FUNDED_EXPRESS_SIM,
+    )
+    express_sim_summary = express_funded_reset_sim_summary_dict(ho_express_sim)
+    express_sim_summary["rules"] = {
+        k: getattr(DEFAULT_FUNDED_EXPRESS_SIM, k)
+        for k in (
+            "account_size",
+            "max_drawdown",
+            "daily_loss_limit",
+            "lock_trigger_balance",
+            "locked_floor_balance",
+        )
+    }
+    print(
+        f"express_funded_reset breaches={ho_express_sim.funded_accounts_failed} "
+        f"accounts_used={ho_express_sim.funded_accounts_used} "
+        f"stints_simulated={ho_express_sim.stints_opened} bank_accrued=${ho_express_sim.accrued_pnl_bank:.2f} "
+        f"peak_nominal=${ho_express_sim.max_nominal_peak_balance:.2f}",
+    )
 
     _print_stage_header("Stage 6 — Monte Carlo (trade-order)")
     holdout_mc = run_holdout_trade_monte_carlo(
@@ -521,6 +545,7 @@ def main(argv: list[str] | None = None) -> int:
         },
         "sensitivity": sensitivity_serial,
         "holdout": _eval_json(holdout_eval),
+        "express_funded_reset_sim": express_sim_summary,
         "holdout_monte_carlo": ho_mc_d,
         "verdict": verdict_summary_dict(verdict),
         "verdict_thresholds": asdict(verdict_thresholds),
@@ -531,9 +556,24 @@ def main(argv: list[str] | None = None) -> int:
         ),
     }
 
-    out_json = output_dir / f"{strategy_key}_{args.timeframe}_result.json"
+    json_dir = output_dir / "json"
+    json_dir.mkdir(parents=True, exist_ok=True)
+    out_json = json_dir / f"{strategy_key}_{args.timeframe}_result.json"
     out_json.write_text(json.dumps(result_bundle, indent=2, sort_keys=False, default=str) + "\n")
+    txt_dir = output_dir / "txt summaries"
+    try:
+        summary_path = write_readable_text_from_json_file(
+            out_json,
+            txt_dir / f"{out_json.stem}_summary.txt",
+            style="pipeline",
+        )
+    except Exception as exc:  # noqa: BLE001
+        summary_path = None
+        print(f"WARN: readable summary not written ({exc})", file=sys.stderr)
+
     print(f"result_json={out_json.resolve()}")
+    if summary_path is not None:
+        print(f"readable_summary_txt={summary_path.resolve()}")
 
     sensitivity_flag_label = (
         str(verdict.sensitivity_flag) if verdict.sensitivity_flag is not None else "n/a"
@@ -551,6 +591,8 @@ def main(argv: list[str] | None = None) -> int:
         ("in_sample_net_pnl", f"{sanity.metrics['total_net_pnl']:.2f}"),
         ("result_json", str(out_json.resolve())),
     ]
+    if summary_path is not None:
+        table_rows.append(("readable_summary_txt", str(summary_path.resolve())))
     if params_hash is not None and audit_path is not None:
         table_rows.extend(
             [

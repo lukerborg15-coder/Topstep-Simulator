@@ -57,12 +57,12 @@ def cleanup_user_strategy_files():
         importlib.invalidate_caches()
 
 
-def test_load_user_strategies_empty_directory_does_nothing():
-    before = dict(STRATEGIES)
-
+def test_load_user_strategies_second_call_is_idempotent():
+    """Permanent user strategy modules may register on first load; rerun must not break."""
     load_user_strategies()
-
-    assert STRATEGIES == before
+    snapshot = dict(STRATEGIES)
+    load_user_strategies()
+    assert STRATEGIES == snapshot
 
 
 def test_load_user_strategies_registers_valid_strategy_file():

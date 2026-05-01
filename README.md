@@ -56,9 +56,70 @@ python -m pytest tests/v3/ -q
 | `tests/v3/` | Pytest suite |
 | `config/` | Optional JSON date windows (`--pipeline-config`); see `config/README.md` |
 | `Data/` | MNQ OHLCV CSVs for local runs |
-| `output/` | Result JSON, optional `frozen_params/`, audit artifacts (created when you run the CLI) |
+| `output/` | `json/` result bundles, `txt summaries/` readable exports, optional `frozen_params/`, audit artifacts |
 
 **Requirements:** Python 3.10+ (see `pyproject.toml`).
+
+### What changed recently (changelog)
+
+- **Express funded reset simulation (holdout)** — `FundedExpressSimRules` in `config.py`, `funded_express_sim.py`, multi-stint resets on max-loss with optional EOD **floor lock**; holdout result JSON includes **`express_funded_reset_sim`** (bank across stints, breaches, peaks, drawdown stats). Combine **`simulate_topstep`** is unchanged for WF / evaluator.
+- **Output layout** — CLI writes `<output_dir>/json/<strategy>_<timeframe>_result.json` and a human-readable `<output_dir>/txt summaries/<stem>_summary.txt`. `scripts/summarize_result_json.py` defaults to `output/json/` for the HL2 filename.
+- **`json_readable.py`** — reusable helpers: **`pipeline_result_bundle_to_readable_text`**, **`write_readable_text_from_json_file`** (`style="pipeline"` vs `"pretty"`), used by the CLI and tests.
+- **`user_strategies/hl2_sma_retrace_atr.py`** — example user strategy (HL2 SMA + ATR sizing) auto-loaded from `user_strategies/` via `load_user_strategies()`.
+
+Git keeps **`output/`**, **`Data/*.csv`**, **`frozen_params/`**, and **`*_result.json`** out of commits (see `.gitignore`). Do not force-add local run artifacts when pushing to GitHub.
+
+### Running the full pipeline (two strategies)
+
+Use **`--mode full`** if you want stage 4 **parameter sensitivity** as well as walk-forward; default **`quick`** still runs walk-forward → holdout → Monte Carlo → verdict (sensitivity skipped).
+
+Install from this repo so **`v3`** resolves here (not another clone on your machine):
+
+```bash
+cd /path/to/topstep-pipeline
+pip install -e .
+```
+
+If **`hl2_sma_retrace_atr`** does not appear in `--list-strategies`, another environment may be shadowing `v3`. From the repo root force this package first:
+
+```powershell
+# Windows PowerShell (repo root)
+$env:PYTHONPATH = "$(Resolve-Path .\src)"
+python -m v3.cli --strategy hl2_sma_retrace_atr --mode full --timeframe 5min
+```
+
+```bash
+# macOS / Linux (repo root)
+PYTHONPATH=./src python -m v3.cli --strategy hl2_sma_retrace_atr --mode full --timeframe 5min
+```
+
+**Session pivot (pivot rejection) — full pipeline:**
+
+```bash
+python -m v3.cli --strategy session_pivot_rejection --mode full --timeframe 5min
+```
+
+**HL2 SMA / ATR user strategy — full pipeline** (large `param_grid`; cap candidates if needed):
+
+```bash
+python -m v3.cli --strategy hl2_sma_retrace_atr --mode full --timeframe 5min --max-grid 200
+```
+
+Add **`--force`** only if you need to continue past failed sanity or walk-forward gates (verdict may still be `REJECT`). Omit **`--max-grid`** for the full grid (long runtime).
+
+### Push to GitHub (no local runs in the repo)
+
+1. Confirm ignores: `git status` must **not** list anything under `output/`, `Data/*.csv`, or `*_result.json`. If something was committed earlier, run `git rm -r --cached output` (and similar) then commit.
+2. Commit source and tests only, then push:
+
+```bash
+git add -A
+git status   # review
+git commit -m "Add Express funded sim, json summaries, output layout, HL2 user strategy"
+git push origin main
+```
+
+Adjust branch and remote name as needed (`git remote -v`).
 
 ---
 
@@ -87,12 +148,12 @@ flowchart LR
 2. **Backtest (in-sample)** — `in_sample_sanity` window; sanity gates (e.g. min trades, win rate, profit factor) unless `--force`.
 3. **Walk-forward** — train/test folds from `config.py` or JSON; grid search per fold; robust parameter choice; per-fold sequential Topstep eval; **each OOS fold** must meet **min sequential pass rate** (default 40%).
 4. **Parameter sensitivity** — only if `full` mode and strategy defines `param_grid`: for each parameter value, backtest in-sample → **`run_combine_simulator`** (day-group bootstrap → Combine **pass rate**); detect **cliffs** vs baseline.
-5. **Holdout** — evaluate **final params** on the **holdout** window (no parameter tuning).
+5. **Holdout** — evaluate **final params** on the **holdout** window (no parameter tuning). The result JSON also includes **`express_funded_reset_sim`**: accrued bank across resets, breaches, milestones (Parallel to legacy Combine **`simulate_topstep`** on evaluator rows).
 6. **Monte Carlo (holdout)** — many **random permutations of trades** on holdout; distribution of total PnL and max drawdown (**not** the same as day-aware Combine bootstrap).
 7. **Verdict** — combine walk-forward flags, sensitivity cliff, holdout PnL, holdout MC PnL p05.
 8. **Freeze + audit** — if not `REJECT`, write frozen param JSON + hash; write audit stamp and append `audit_log.jsonl`.
 
-CLI writes a summary JSON: `<output_dir>/<strategy>_<timeframe>_result.json`.
+CLI writes the result bundle to `<output_dir>/json/<strategy>_<timeframe>_result.json` and a staged readable copy to `<output_dir>/txt summaries/<stem>_summary.txt`.
 
 ---
 
@@ -122,6 +183,11 @@ CLI writes a summary JSON: `<output_dir>/<strategy>_<timeframe>_result.json`.
 
 - **`topstep.py`** implements Combine-style PnL path simulation: trailing drawdown floor (EOD ratchet), daily loss limit, profit target, consistency rule. **`count_sequential_eval_passes`** chains evals across calendar days on a single OOS trade list for walk-forward gates.
 - Rules and account shape live in **`TopStepRules`** / **`TOPSTEP_50K`** in **`config.py`** (adjust if your combine product differs).
+
+### Express funded reset simulation (holdout)
+
+- **`funded_express_sim.py`** runs a **multi-stint** Express-funded-style clock on **chronological** holdout fills: trailing max-loss (**EOD** ratchet unless the optional **floor lock** milestone engages), **`daily_loss_limit`** halts intra-day processing like the Combine simulator, **no** Combine profit/consistency early pass, breaches **reset** to `FundedExpressSimRules.account_size` and continue trades (same continuation rule as **`count_sequential_eval_passes`**: the termination **calendar day** is excluded from the next stint).
+- **Thresholds**: defaults live beside **`TOPSTEP_50K`** as **`FundedExpressSimRules`** / **`DEFAULT_FUNDED_EXPRESS_SIM`** (**`lock_trigger_balance`**, **`locked_floor_balance`**, **`max_drawdown`**, **`daily_loss_limit`**). Override in code when Topstep wording or product SKU differs.
 
 ### Combine pass rate (sensitivity only)
 
@@ -170,13 +236,16 @@ CLI writes a summary JSON: `<output_dir>/<strategy>_<timeframe>_result.json`.
 | `validator.py` | Strategy validation and filter reference checks |
 | `evaluator.py` | Trade sim, metrics, WF, sequential OOS stats |
 | `topstep.py` | Combine simulation + sequential eval counting |
+| `funded_express_sim.py` | Holdout-funded multi-stint resets + Express-type floor milestones |
 | `combine_simulator.py` | Day-group bootstrap → Combine pass rate |
 | `sensitivity.py` | Param sweep + cliff detection |
 | `holdout_monte_carlo.py` | Trade-order permutation MC on holdout |
 | `verdict.py` | Pipeline and Combine-sim verdict helpers |
 | `freeze.py` | Frozen parameter snapshots + verification |
 | `audit_stamp.py` | Audit JSON + JSONL log |
+| `json_readable.py` | Result JSON → readable text (`pipeline` / `pretty`) |
 | `user_strategies/__init__.py` | Extension point for extra strategies |
+| `user_strategies/hl2_sma_retrace_atr.py` | Example HL2 SMA + ATR strategy |
 
 ---
 
@@ -187,6 +256,8 @@ CLI writes a summary JSON: `<output_dir>/<strategy>_<timeframe>_result.json`.
 | `test_v3_setup.py` | Config, windows, strategy registry smoke tests |
 | `test_v3_evaluator.py` | Backtest and walk-forward behavior |
 | `test_v3_combine_simulator.py` | Day-group bootstrap + Topstep integration |
+| `test_json_readable.py` | Pretty / pipeline text export |
+| `test_funded_express_sim.py` | Express funded reset bookkeeping + milestones |
 | `test_v3_sensitivity.py` | Parameter cliff logic |
 | `test_v3_verdict.py` | Verdict thresholds |
 | `test_v3_validator.py` | Strategy validation |
@@ -201,5 +272,6 @@ CLI writes a summary JSON: `<output_dir>/<strategy>_<timeframe>_result.json`.
 ## Design notes
 
 - **Two Monte Carlos, two questions:** (1) *Day-order* bootstrap + **`simulate_topstep`** → “Combine pass rate” (sensitivity). (2) *Trade-order* shuffle + **metrics** → “PnL/DD path luck” (holdout MC). Neither replaces the other.
+- **Combine vs funded reset:** evaluator paths still expose Combine **`simulate_topstep`** summaries; **`express_funded_reset_sim`** applies Express-style funded resets **only on the aggregated holdout list** JSON block (economics accumulate per stint closure).
 - **`--force`** can bypass some early exits; **verdict** may still reject downstream.
 - CLI **reject/ready threshold flags** are serialized into the result JSON; the **main pipeline verdict** (`compute_pipeline_verdict`) uses the staged gates described above — see `verdict.py` if you want to align those knobs.

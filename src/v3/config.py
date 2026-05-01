@@ -106,6 +106,28 @@ TOPSTEP_50K = TopStepRules()
 
 
 @dataclass(frozen=True)
+class FundedExpressSimRules:
+    """Express-funded-style max-loss milestones (approximate vs official wording).
+
+    See Topstep Express Funded Account Rules (maximum loss tied to highest EOD balance):
+        https://www.topstep.com/express-funded-account-rules/
+
+    Numeric defaults follow the commonly quoted funded account lock-milestone story
+    (trigger at ``SB + max_drawdown + $100``, floor at ``SB + $100`` for Combine-style $50k
+    sizing). Topstep wording can change; override fields if your product differs.
+    """
+
+    account_size: float = 50_000.0
+    max_drawdown: float = 2_000.0
+    daily_loss_limit: float = 1_000.0
+    lock_trigger_balance: float = 52_100.0
+    locked_floor_balance: float = 50_100.0
+
+
+DEFAULT_FUNDED_EXPRESS_SIM = FundedExpressSimRules()
+
+
+@dataclass(frozen=True)
 class ScoringWeights:
     """
     Weights for strategy scoring during walk-forward optimization.

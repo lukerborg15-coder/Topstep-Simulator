@@ -21,10 +21,12 @@ Data/*.csv
 data/*.dbn
 data/*.parquet
 
-# Pipeline outputs (generated at runtime — not committed)
+# Pipeline outputs (local runs — do not commit or push)
 output/
 frozen_params/
 *_result.json
+# readable exports from `json_readable` / CLI (if ever written outside output/)
+*_result_summary.txt
 
 # OS
 .DS_Store

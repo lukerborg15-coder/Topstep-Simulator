@@ -25,6 +25,10 @@ from v3.config import (
 from v3.strategies import STRATEGIES, StrategySpec, TradeSignal, load_user_strategies, register_strategy
 
 
+def _cli_e2e_result_json(output_dir: Path) -> Path:
+    return output_dir / "json" / "cli_e2e_mock_5min_result.json"
+
+
 NARROW_PIPELINE_WINDOWS = PipelineWindows(
     in_sample_sanity=DateWindow("in_sample_sanity", "2024-06-03", "2024-06-14"),
     walk_forward=(
@@ -363,7 +367,7 @@ def test_skip_wf_uses_default_params(
     )
 
     assert code == 0
-    result_json = Path(output_dir) / "cli_e2e_mock_5min_result.json"
+    result_json = _cli_e2e_result_json(output_dir)
     blob = json.loads(result_json.read_text())
     assert blob["skip_walk_forward"] is True
     assert blob["walk_forward"]["best_params"] == dict(MOCK_CLI_SPEC.default_params)
@@ -404,7 +408,7 @@ def test_pipeline_end_to_end_mock_strategy(
     )
 
     assert code == 0
-    result_json = Path(output_dir) / "cli_e2e_mock_5min_result.json"
+    result_json = _cli_e2e_result_json(output_dir)
     blob = json.loads(result_json.read_text())
     assert blob["skip_walk_forward"] is False
     assert blob["walk_forward"]["aggregate"]["wf_folds"] == 4
@@ -452,7 +456,7 @@ def test_skip_sensitivity_flag_omits_sensitivity_from_result(
 
     assert code == 0
     captured = capsys.readouterr()
-    blob = json.loads((output_dir / "cli_e2e_mock_5min_result.json").read_text())
+    blob = json.loads(_cli_e2e_result_json(output_dir).read_text())
     assert blob["skip_sensitivity"] is True
     assert blob["sensitivity"] is None
     assert "Skipped: --skip-sensitivity flag" in captured.out
@@ -687,7 +691,7 @@ def test_verdict_threshold_cli_args_persist_in_result_bundle(
     )
 
     captured = capsys.readouterr()
-    blob = json.loads((output_dir / "cli_e2e_mock_5min_result.json").read_text())
+    blob = json.loads(_cli_e2e_result_json(output_dir).read_text())
     assert code == 0
     assert blob["verdict_thresholds"]["reject_pass_rate_pct"] == 90.0
     assert "holdout_monte_carlo" in blob
@@ -734,7 +738,7 @@ def test_sensitivity_runs_and_appears_in_result(
     )
 
     assert code == 0
-    blob = json.loads((output_dir / "cli_e2e_mock_5min_result.json").read_text())
+    blob = json.loads(_cli_e2e_result_json(output_dir).read_text())
     assert blob["skip_sensitivity"] is False
     assert blob["sensitivity"] is not None
     sens = blob["sensitivity"]
