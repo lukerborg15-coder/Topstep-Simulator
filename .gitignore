@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+.env
+.venv/
+venv/
+
+# Test artifacts
+.pytest_cache/
+.pytest_tmp/
+htmlcov/
+.coverage
+
+# Data files (user provides these — not committed)
+data/*.csv
+Data/*.csv
+data/*.dbn
+data/*.parquet
+
+# Pipeline outputs (generated at runtime — not committed)
+output/
+frozen_params/
+*_result.json
+
+# OS
+.DS_Store
+Thumbs.db
+pytest-cache-files-*/
+
+src/v3/user_strategies/tmp_test_strategy.py
