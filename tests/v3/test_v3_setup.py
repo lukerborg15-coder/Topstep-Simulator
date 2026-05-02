@@ -18,6 +18,7 @@ def test_v3_config_exports_and_windows():
         "orb_wick_rejection",
         "session_pivot_rejection",
         "session_pivot_break",
+        "hl2_sma_retrace_atr",
     )
     assert TOPSTEP_50K.account_size == 50_000.0
 

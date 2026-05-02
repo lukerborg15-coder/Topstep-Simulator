@@ -453,3 +453,12 @@ def load_user_strategies() -> None:
             continue
         importlib.import_module(f"{__package__}.user_strategies.{path.stem}")
     validate_filter_references(STRATEGIES)
+
+
+def _install_bundled_user_strategies() -> None:
+    """Shipped user strategy registers on import — must run after ``register_strategy`` is defined."""
+
+    importlib.import_module(f"{__package__}.user_strategies.hl2_sma_retrace_atr")
+
+
+_install_bundled_user_strategies()

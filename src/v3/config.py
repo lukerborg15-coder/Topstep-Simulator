@@ -27,6 +27,7 @@ STRATEGY_NAMES = (
     "orb_wick_rejection",
     "session_pivot_rejection",
     "session_pivot_break",
+    "hl2_sma_retrace_atr",
 )
 
 
