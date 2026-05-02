@@ -34,3 +34,14 @@ Thumbs.db
 pytest-cache-files-*/
 
 src/v3/user_strategies/tmp_test_strategy.py
+
+# Dev notes
+AGENT_PROMPTS.md
+AUDIT_PROMPT.md
+COPY_PASTE_PROMPTS.md
+DESIGN_NOTES.md
+EXACT_CHANGES.md
+IMPLEMENTATION_SUMMARY.md
+WHY_I_OVERESTIMATED.md
+.claude/
+tmp_pytest*/
