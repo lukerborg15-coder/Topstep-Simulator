@@ -8,6 +8,7 @@ termination calendar day (same convention as ``count_sequential_eval_passes``).
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import Any
 
 import pandas as pd
@@ -26,6 +27,17 @@ class ExpressFundedSimResult:
     max_nominal_peak_balance: float
     worst_daily_drawdown: float
     worst_stint_peak_to_trough_drawdown_from_peak_balance: float
+    current_account_active: bool
+    current_account_pnl: float | None
+    current_max_drawdown: float | None
+    current_win_rate_pct: float | None
+    current_avg_r_multiple: float | None
+    current_profit_factor: float | None
+    current_sharpe_annualized: float | None
+    total_win_rate_pct: float
+    total_avg_r_multiple: float
+    best_trade_pnl: float
+    worst_trade_pnl: float
     stints_summary: tuple[dict[str, Any], ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
@@ -40,6 +52,17 @@ class ExpressFundedSimResult:
             "worst_stint_peak_to_trough_drawdown_from_peak_balance": (
                 self.worst_stint_peak_to_trough_drawdown_from_peak_balance
             ),
+            "current_account_active": self.current_account_active,
+            "current_account_pnl": self.current_account_pnl,
+            "current_max_drawdown": self.current_max_drawdown,
+            "current_win_rate_pct": self.current_win_rate_pct,
+            "current_avg_r_multiple": self.current_avg_r_multiple,
+            "current_profit_factor": self.current_profit_factor,
+            "current_sharpe_annualized": self.current_sharpe_annualized,
+            "total_win_rate_pct": self.total_win_rate_pct,
+            "total_avg_r_multiple": self.total_avg_r_multiple,
+            "best_trade_pnl": self.best_trade_pnl,
+            "worst_trade_pnl": self.worst_trade_pnl,
             "stints_summary": list(self.stints_summary),
         }
 
@@ -56,9 +79,69 @@ class _StintOutcome:
     termination_day: pd.Timestamp | None
     terminal_balance: float
     trades_applied_count: int
+    trades_applied: tuple[TradeResult, ...]
+    first_trade_day: pd.Timestamp | None
+    last_trade_day: pd.Timestamp | None
     peak_nominal_balance: float
     worst_daily_dd: float
     worst_peak_to_trough: float
+
+
+@dataclass(frozen=True)
+class _TradeMetrics:
+    win_rate_pct: float
+    avg_r_multiple: float
+    best_trade_pnl: float
+    worst_trade_pnl: float
+    profit_factor: float
+    sharpe_annualized: float
+
+
+def _metrics_for_trades(trades: tuple[TradeResult, ...] | list[TradeResult]) -> _TradeMetrics:
+    if not trades:
+        return _TradeMetrics(
+            win_rate_pct=0.0,
+            avg_r_multiple=0.0,
+            best_trade_pnl=0.0,
+            worst_trade_pnl=0.0,
+            profit_factor=math.inf,
+            sharpe_annualized=0.0,
+        )
+
+    pnls = [float(t.net_pnl) for t in trades]
+    r_values = [float(t.r_multiple) for t in trades]
+    wins = [p for p in pnls if p > 0]
+    losses = [p for p in pnls if p < 0]
+
+    win_rate_pct = len(wins) / len(pnls) * 100.0
+    avg_r_multiple = sum(r_values) / len(r_values)
+    best_trade_pnl = max(pnls)
+    worst_trade_pnl = min(pnls)
+
+    loss_sum = sum(losses)
+    profit_factor = math.inf if loss_sum >= 0 else sum(wins) / abs(loss_sum)
+
+    variance = sum((r - avg_r_multiple) ** 2 for r in r_values) / len(r_values)
+    std_r = math.sqrt(variance)
+    sharpe_annualized = (avg_r_multiple / std_r * math.sqrt(252.0)) if std_r > 0 else 0.0
+
+    return _TradeMetrics(
+        win_rate_pct=win_rate_pct,
+        avg_r_multiple=avg_r_multiple,
+        best_trade_pnl=best_trade_pnl,
+        worst_trade_pnl=worst_trade_pnl,
+        profit_factor=profit_factor,
+        sharpe_annualized=sharpe_annualized,
+    )
+
+
+def _survival_days(stint: _StintOutcome) -> int:
+    if stint.first_trade_day is None:
+        return 0
+    end_day = stint.termination_day if stint.breached else stint.last_trade_day
+    if end_day is None:
+        return 0
+    return int((end_day - stint.first_trade_day).days)
 
 
 def _simulate_express_single_stint(
@@ -75,7 +158,7 @@ def _simulate_express_single_stint(
     if not day_trades:
         sz = rules.account_size
         return (
-            _StintOutcome(False, None, sz, 0, sz, 0.0, 0.0),
+            _StintOutcome(False, None, sz, 0, (), None, None, sz, 0.0, 0.0),
             [],
         )
 
@@ -85,6 +168,9 @@ def _simulate_express_single_stint(
     trail_locked = False
 
     trades_applied_count = 0
+    trades_applied: list[TradeResult] = []
+    first_trade_day: pd.Timestamp | None = None
+    last_trade_day: pd.Timestamp | None = None
     nominal_peak_stint = balance
     worst_daily_dd_stint = 0.0
     balance_high_water = balance
@@ -100,9 +186,13 @@ def _simulate_express_single_stint(
         intraday_min = balance
 
         for trade in day_trade_list:
+            if first_trade_day is None:
+                first_trade_day = cal_day
+            last_trade_day = cal_day
             day_net += trade.net_pnl
             balance += trade.net_pnl
             trades_applied_count += 1
+            trades_applied.append(trade)
             nominal_peak_stint = max(nominal_peak_stint, balance)
             intraday_peak = max(intraday_peak, balance)
             intraday_min = min(intraday_min, balance)
@@ -130,6 +220,9 @@ def _simulate_express_single_stint(
                     termination_day,
                     balance,
                     trades_applied_count,
+                    tuple(trades_applied),
+                    first_trade_day,
+                    last_trade_day,
                     nominal_peak_stint,
                     worst_daily_dd_stint,
                     worst_excursion_stint,
@@ -155,6 +248,9 @@ def _simulate_express_single_stint(
             None,
             balance,
             trades_applied_count,
+            tuple(trades_applied),
+            first_trade_day,
+            last_trade_day,
             nominal_peak_stint,
             worst_daily_dd_stint,
             worst_excursion_stint,
@@ -188,15 +284,30 @@ def simulate_express_funded_resets(
             max_nominal_peak_balance=rules.account_size,
             worst_daily_drawdown=0.0,
             worst_stint_peak_to_trough_drawdown_from_peak_balance=0.0,
+            current_account_active=False,
+            current_account_pnl=None,
+            current_max_drawdown=None,
+            current_win_rate_pct=None,
+            current_avg_r_multiple=None,
+            current_profit_factor=None,
+            current_sharpe_annualized=None,
+            total_win_rate_pct=0.0,
+            total_avg_r_multiple=0.0,
+            best_trade_pnl=0.0,
+            worst_trade_pnl=0.0,
             stints_summary=(),
         )
 
     remaining = sorted_trades[:]
+    all_applied_trades: list[TradeResult] = []
+    final_stint: _StintOutcome | None = None
 
     while remaining:
         stints_opened += 1
 
         stint, leftover = _simulate_express_single_stint(remaining, rules)
+        final_stint = stint
+        all_applied_trades.extend(stint.trades_applied)
         stint_bank_incr = stint.terminal_balance - rules.account_size
         accrued += stint_bank_incr
         global_nominal_peak = max(global_nominal_peak, stint.peak_nominal_balance)
@@ -205,6 +316,7 @@ def simulate_express_funded_resets(
             worst_stint_peaks_trough_global,
             stint.worst_peak_to_trough,
         )
+        metrics = _metrics_for_trades(stint.trades_applied)
 
         row: dict[str, Any] = {
             "stint_index": stints_opened - 1,
@@ -213,6 +325,12 @@ def simulate_express_funded_resets(
             "terminal_balance": stint.terminal_balance,
             "bank_increment": stint_bank_incr,
             "trades_applied_count": stint.trades_applied_count,
+            "survival_days": _survival_days(stint),
+            "win_rate_pct": metrics.win_rate_pct,
+            "avg_r_multiple": metrics.avg_r_multiple,
+            "best_trade_pnl": metrics.best_trade_pnl,
+            "worst_trade_pnl": metrics.worst_trade_pnl,
+            "profit_factor": metrics.profit_factor,
             "stint_peak_balance": stint.peak_nominal_balance,
             "stint_worst_daily_dd": stint.worst_daily_dd,
             "stint_worst_peak_to_trough": stint.worst_peak_to_trough,
@@ -227,6 +345,23 @@ def simulate_express_funded_resets(
             break
 
     funded_accounts_used = 1 + breaches
+    total_metrics = _metrics_for_trades(all_applied_trades)
+    current_account_active = final_stint is not None and not final_stint.breached
+    if current_account_active and final_stint is not None:
+        current_metrics = _metrics_for_trades(final_stint.trades_applied)
+        current_account_pnl = final_stint.terminal_balance - rules.account_size
+        current_max_drawdown = final_stint.worst_peak_to_trough
+        current_win_rate_pct = current_metrics.win_rate_pct
+        current_avg_r_multiple = current_metrics.avg_r_multiple
+        current_profit_factor = current_metrics.profit_factor
+        current_sharpe_annualized = current_metrics.sharpe_annualized
+    else:
+        current_account_pnl = None
+        current_max_drawdown = None
+        current_win_rate_pct = None
+        current_avg_r_multiple = None
+        current_profit_factor = None
+        current_sharpe_annualized = None
 
     return ExpressFundedSimResult(
         accrued_pnl_bank=accrued,
@@ -236,6 +371,17 @@ def simulate_express_funded_resets(
         max_nominal_peak_balance=global_nominal_peak,
         worst_daily_drawdown=worst_daily_global,
         worst_stint_peak_to_trough_drawdown_from_peak_balance=worst_stint_peaks_trough_global,
+        current_account_active=current_account_active,
+        current_account_pnl=current_account_pnl,
+        current_max_drawdown=current_max_drawdown,
+        current_win_rate_pct=current_win_rate_pct,
+        current_avg_r_multiple=current_avg_r_multiple,
+        current_profit_factor=current_profit_factor,
+        current_sharpe_annualized=current_sharpe_annualized,
+        total_win_rate_pct=total_metrics.win_rate_pct,
+        total_avg_r_multiple=total_metrics.avg_r_multiple,
+        best_trade_pnl=total_metrics.best_trade_pnl,
+        worst_trade_pnl=total_metrics.worst_trade_pnl,
         stints_summary=tuple(stint_rows),
     )
 

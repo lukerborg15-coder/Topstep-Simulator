@@ -253,6 +253,7 @@ def test_apply_sensitivity_downgrades_combine_ready_when_cliff():
         default_pass_rate=80.0,
         min_neighbor_pass_rate=10.0,
         drop_threshold=0.25,
+        default_params={"width": 1.0},
     )
     updated = apply_sensitivity_to_verdict(verdict, cliff_report)
     assert updated.verdict == "PROMISING"
@@ -272,6 +273,7 @@ def test_apply_sensitivity_leaves_combine_ready_intact_when_no_cliff():
         default_pass_rate=80.0,
         min_neighbor_pass_rate=78.0,
         drop_threshold=0.25,
+        default_params={"width": 1.0},
     )
     updated = apply_sensitivity_to_verdict(verdict, flat_report)
     assert updated.verdict == "COMBINE-READY"
@@ -290,6 +292,7 @@ def test_apply_sensitivity_leaves_reject_unchanged_regardless():
         default_pass_rate=20.0,
         min_neighbor_pass_rate=0.0,
         drop_threshold=0.25,
+        default_params={"width": 1.0},
     )
     updated = apply_sensitivity_to_verdict(verdict, cliff_report)
     assert updated.verdict == "REJECT"
@@ -306,6 +309,7 @@ def test_apply_sensitivity_adds_cliff_warning_to_warn_reasons():
         default_pass_rate=80.0,
         min_neighbor_pass_rate=10.0,
         drop_threshold=0.25,
+        default_params={"lookback": 5, "width": 1.0},
     )
     updated = apply_sensitivity_to_verdict(verdict, cliff_report)
     assert any("lookback" in r and "width" in r for r in updated.warn_reasons)
@@ -322,6 +326,7 @@ def test_apply_sensitivity_no_duplicate_warn_on_reapply():
         default_pass_rate=80.0,
         min_neighbor_pass_rate=10.0,
         drop_threshold=0.25,
+        default_params={"width": 1.0},
     )
     once = apply_sensitivity_to_verdict(verdict, cliff_report)
     twice = apply_sensitivity_to_verdict(once, cliff_report)
@@ -342,6 +347,7 @@ def test_sensitivity_summary_dict_contains_required_keys():
         default_pass_rate=80.0,
         min_neighbor_pass_rate=80.0,
         drop_threshold=0.25,
+        default_params={"width": 1.0},
     )
     d = sensitivity_summary_dict(report)
     expected = {
@@ -365,6 +371,7 @@ def test_sensitivity_summary_dict_values_match_report():
         default_pass_rate=80.0,
         min_neighbor_pass_rate=10.0,
         drop_threshold=0.25,
+        default_params={"width": 1.0},
     )
     d = sensitivity_summary_dict(report)
     assert d["sensitivity_is_cliff"] is True

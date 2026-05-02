@@ -8,7 +8,7 @@ from v3.strategies import STRATEGIES, StrategySpec
 
 
 def test_v3_config_exports_and_windows():
-    assert WINDOWS.in_sample_sanity.start == "2022-09-01"
+    assert WINDOWS.in_sample_sanity is None
     assert WINDOWS.holdout.start == "2024-09-01"
     assert STRATEGY_NAMES == (
         "connors_rsi2",
@@ -26,7 +26,6 @@ def test_v3_config_exports_and_windows():
 def test_v3_windows_do_not_overlap():
     assert all(window.train.end <= "2024-08-31" for window in WINDOWS.walk_forward)
     holdout_start = WINDOWS.holdout.start
-    assert WINDOWS.in_sample_sanity.end < holdout_start
     assert holdout_start <= WINDOWS.holdout.end
     for window in WINDOWS.walk_forward:
         assert window.test.end < holdout_start

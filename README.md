@@ -1,129 +1,71 @@
-# Topstep pipeline
+# Topstep Pipeline
 
-Python toolkit to **backtest MNQ strategies**, run **walk-forward** selection, stress **parameters**, evaluate a **holdout** window, run two kinds of **Monte Carlo**, and emit a **verdict** with optional **frozen parameters** and **audit** artifacts.
+A backtesting and evaluation pipeline for MNQ futures strategies against Topstep Combine rules. Runs walk-forward optimization, sensitivity analysis, Monte Carlo simulation, regime classification, and final verdict scoring — all from a single CLI command.
 
-## Quick start
+---
+
+## Quick Start
 
 ```bash
-python -m venv .venv
-# Windows: .venv\Scripts\activate
-# Unix:    source .venv/bin/activate
-
 pip install -e .
 python -m v3.cli --list-strategies
-python -m v3.cli --strategy connors_rsi2 --timeframe 5min
+python -m v3.cli --strategy hl2_sma_retrace_atr --timeframe 5min
 ```
 
 Console entry point (after install): `topstep-pipeline` (same flags as `python -m v3.cli`).
 
-### Data
-
-Place OHLCV CSVs under `Data/` (or point env at your folder):
-
-- `mnq_1min_databento.csv`, `mnq_5min_databento.csv`, `mnq_15min_databento.csv`  
-- Expected columns include OHLCV + a datetime index/column (see `data.py`).
-
-Environment overrides:
-
-| Variable | Purpose |
-| -------- | ------- |
-| `TOPSTEP_PIPELINE_DATA_DIR` | Directory containing MNQ CSV bundles (default: `<repo>/Data`) |
-| `TOPSTEP_PIPELINE_OUTPUT_DIR` | Result JSON / artifacts (default: `<repo>/output`) |
-
-### Modes
-
-| Mode | Sensitivity (stage 4) | Notes |
-| ---- | ----------------------- | ----- |
-| `quick` (default) | Skipped | Faster; walk-forward + holdout + holdout MC + verdict still run |
-| `full` | Runs | Requires strategy `param_grid`; uses Combine bootstrap pass rates |
-| `holdout-only` | Skipped | Skips walk-forward; uses default params |
-
-Flags: `--mode full`, `--skip-sensitivity`, `--skip-wf`, `--force` (continue past some hard stops; verdict may still be `REJECT`).
-
-### Tests
-
-```bash
-python -m pytest tests/v3/ -q
+**Windows shortcut** (sets PYTHONPATH automatically):
+```cmd
+run-cli.cmd --strategy hl2_sma_retrace_atr --mode full --timeframe 5min
 ```
 
----
-
-## Repository layout
-
-| Path | Role |
-| ---- | ---- |
-| `src/v3/` | Package `v3`: backtest, Topstep rules, pipeline CLI |
-| `tests/v3/` | Pytest suite |
-| `config/` | Optional JSON date windows (`--pipeline-config`); see `config/README.md` |
-| `Data/` | MNQ OHLCV CSVs for local runs |
-| `output/` | `json/` result bundles, `txt summaries/` readable exports, optional `frozen_params/`, audit artifacts |
-
-**Requirements:** Python 3.10+ (see `pyproject.toml`).
-
-### What changed recently (changelog)
-
-- **Express funded reset simulation (holdout)** — `FundedExpressSimRules` in `config.py`, `funded_express_sim.py`, multi-stint resets on max-loss with optional EOD **floor lock**; holdout result JSON includes **`express_funded_reset_sim`** (bank across stints, breaches, peaks, drawdown stats). Combine **`simulate_topstep`** is unchanged for WF / evaluator.
-- **Output layout** — CLI writes `<output_dir>/json/<strategy>_<timeframe>_result.json` and a human-readable `<output_dir>/txt summaries/<stem>_summary.txt`. `scripts/summarize_result_json.py` defaults to `output/json/` for the HL2 filename.
-- **`json_readable.py`** — reusable helpers: **`pipeline_result_bundle_to_readable_text`**, **`write_readable_text_from_json_file`** (`style="pipeline"` vs `"pretty"`), used by the CLI and tests.
-- **`user_strategies/hl2_sma_retrace_atr.py`** — example user strategy (HL2 SMA + ATR sizing) auto-loaded from `user_strategies/` via `load_user_strategies()`.
-
-Git keeps **`output/`**, **`Data/*.csv`**, **`frozen_params/`**, and **`*_result.json`** out of commits (see `.gitignore`). Do not force-add local run artifacts when pushing to GitHub.
-
-### Running the full pipeline (two strategies)
-
-Use **`--mode full`** if you want stage 4 **parameter sensitivity** as well as walk-forward; default **`quick`** still runs walk-forward → holdout → Monte Carlo → verdict (sensitivity skipped).
-
-Install from this repo so **`v3`** resolves here (not another clone on your machine):
-
-```bash
-cd /path/to/topstep-pipeline
-pip install -e .
-```
-
-If **`hl2_sma_retrace_atr`** does not appear in `--list-strategies`, another environment may be shadowing `v3`. From the repo root force this package first:
-
+**Force PYTHONPATH if another v3 install shadows this one:**
 ```powershell
-# Windows PowerShell (repo root)
+# PowerShell
 $env:PYTHONPATH = "$(Resolve-Path .\src)"
 python -m v3.cli --strategy hl2_sma_retrace_atr --mode full --timeframe 5min
 ```
-
 ```bash
-# macOS / Linux (repo root)
+# macOS / Linux
 PYTHONPATH=./src python -m v3.cli --strategy hl2_sma_retrace_atr --mode full --timeframe 5min
 ```
 
-**Session pivot (pivot rejection) — full pipeline:**
+---
 
+## Requirements
+
+- Python 3.10+
+- `pandas >= 2.0`, `numpy >= 1.25`, `scipy >= 1.11`, `matplotlib >= 3.7`
+
+Install:
 ```bash
-python -m v3.cli --strategy session_pivot_rejection --mode full --timeframe 5min
+pip install -e .
 ```
-
-**HL2 SMA / ATR user strategy — full pipeline** (large `param_grid`; cap candidates if needed):
-
-```bash
-python -m v3.cli --strategy hl2_sma_retrace_atr --mode full --timeframe 5min --max-grid 200
-```
-
-Add **`--force`** only if you need to continue past failed sanity or walk-forward gates (verdict may still be `REJECT`). Omit **`--max-grid`** for the full grid (long runtime).
-
-### Push to GitHub (no local runs in the repo)
-
-1. Confirm ignores: `git status` must **not** list anything under `output/`, `Data/*.csv`, or `*_result.json`. If something was committed earlier, run `git rm -r --cached output` (and similar) then commit.
-2. Commit source and tests only, then push:
-
-```bash
-git add -A
-git status   # review
-git commit -m "Add Express funded sim, json summaries, output layout, HL2 user strategy"
-git push origin main
-```
-
-Adjust branch and remote name as needed (`git remote -v`).
 
 ---
 
-## Pipeline stages (what runs, in order)
+## Data Setup
+
+Place MNQ OHLCV CSVs in `Data/` (project root). Expected naming convention:
+
+```
+Data/MNQ_5min.csv
+Data/MNQ_1min.csv
+Data/MNQ_15min.csv
+```
+
+Override via environment variable:
+
+| Variable | Purpose |
+|---|---|
+| `TOPSTEP_PIPELINE_DATA_DIR` | Directory containing MNQ CSV bundles (default: `<repo>/Data`) |
+| `TOPSTEP_PIPELINE_OUTPUT_DIR` | Result JSON / artifacts (default: `<repo>/output`) |
+
+Or at runtime: `--data-dir /path/to/data`
+
+---
+
+## Pipeline Stages
 
 ```mermaid
 flowchart LR
@@ -132,146 +74,276 @@ flowchart LR
     SPEC[Strategy spec]
   end
   CSV --> L[load_ohlcv]
-  SPEC --> V[validator]
-  L --> S2[Backtest in-sample]
-  V --> S2
-  S2 --> S3[Walk-forward]
-  S3 --> S4[Sensitivity]
-  S4 --> S5[Holdout eval]
-  S3 --> S5
-  S5 --> S6[Holdout MC]
+  SPEC --> S1[Validate]
+  L --> S2[Walk-forward]
+  S1 --> S2
+  S2 --> S3[Sensitivity + MC1]
+  S2 --> S4[Holdout eval]
+  S3 --> S4
+  S4 --> S5[Holdout MC2]
+  S5 --> S6[Regime classifier]
   S6 --> S7[Verdict]
   S7 --> S8[Freeze + audit]
 ```
 
-1. **Validate** — strategy spec passes structural rules (`validator.py`).
-2. **Backtest (in-sample)** — `in_sample_sanity` window; sanity gates (e.g. min trades, win rate, profit factor) unless `--force`.
-3. **Walk-forward** — train/test folds from `config.py` or JSON; grid search per fold; robust parameter choice; per-fold sequential Topstep eval; **each OOS fold** must meet **min sequential pass rate** (default 40%).
-4. **Parameter sensitivity** — only if `full` mode and strategy defines `param_grid`: for each parameter value, backtest in-sample → **`run_combine_simulator`** (day-group bootstrap → Combine **pass rate**); detect **cliffs** vs baseline.
-5. **Holdout** — evaluate **final params** on the **holdout** window (no parameter tuning). The result JSON also includes **`express_funded_reset_sim`**: accrued bank across resets, breaches, milestones (Parallel to legacy Combine **`simulate_topstep`** on evaluator rows).
-6. **Monte Carlo (holdout)** — many **random permutations of trades** on holdout; distribution of total PnL and max drawdown (**not** the same as day-aware Combine bootstrap).
-7. **Verdict** — combine walk-forward flags, sensitivity cliff, holdout PnL, holdout MC PnL p05.
-8. **Freeze + audit** — if not `REJECT`, write frozen param JSON + hash; write audit stamp and append `audit_log.jsonl`.
-
-CLI writes the result bundle to `<output_dir>/json/<strategy>_<timeframe>_result.json` and a staged readable copy to `<output_dir>/txt summaries/<stem>_summary.txt`.
+1. **Validate** — structural validation of strategy spec
+2. **Walk-forward** — 2 expanding train/test folds; grid search per fold; robust param selection; per-fold sequential Topstep eval (min 40% seq pass rate per fold by default)
+3. **Sensitivity + MC1** — `full` mode only; sweeps each param on the WF dev window via day-group bootstrap, detects cliffs (>25pp drop from default), saves gradient heatmap PNG; runs MC1 (block bootstrap N=1000 on WF dev trades)
+4. **Holdout** — evaluates final params on held-out data (Sep 2024 → Mar 2026); includes Express funded reset simulation
+5. **Monte Carlo MC2** — block-bootstrap (block_size=5, N=1000) on holdout trades; equity path graph saved to `output/graphs/`
+6. **Regime classifier** — calm/volatile bar labeling via rolling log-return stdev; maps holdout trades to regime; emits `prefers_calm` / `prefers_volatile` / `mixed` / `insufficient_data`
+7. **Verdict** — REJECT / PROMISING / COMBINE-READY based on configurable thresholds
+8. **Freeze + audit** — if not REJECT: write frozen param JSON + SHA-256 hash; append `audit_log.jsonl`
 
 ---
 
-## How the code fits together (in depth)
+## Modes
 
-### Data and session model
+| Mode | Sensitivity (Stage 3) | Walk-forward |
+|---|---|---|
+| `quick` (default) | Skipped | Runs |
+| `full` | Runs | Runs |
+| `holdout-only` | Skipped | Skipped — uses `default_params` |
 
-- **`data.py`** loads CSV OHCLV, aligns timezone/session filtering (`session_only` for RTH-style runs; see `SESSION_START` / `SESSION_END` in `config.py`).
-- **`trades.py`** defines **`TradeResult`** (fills, contracts, PnL, R-multiple, etc.).
-
-### Signals and strategies
-
-- **`strategies.py`** registers **`StrategySpec`** entries: `generate` function, `default_params`, optional **`param_grid`** for sensitivity, **`grid()`** for walk-forward candidates, filters and pivot requirements.
-- **`indicators.py`** / **`pivots.py`** — indicator and pivot helpers used by strategies.
-- **`user_strategies/__init__.py`** — hook to load user-defined strategies if you extend the package (see tests for patterns).
-
-### Execution and scoring
-
-- **`evaluator.py`** is the numerical core:
-  - **`simulate_trades`** walks bars after each signal: stop, target, session flatten; position size from **`--eval-risk`** (dollars at stop) capped by **`--max-contracts`** and MNQ point value (`config.MNQ`).
-  - **`compute_metrics`** — win rate, profit factor, max drawdown on trade PnL series, Sharpe-on-R, etc.
-  - **`evaluate_strategy`** — slice window → generate signals → simulate → **`simulate_topstep`** summary attached.
-  - **Walk-forward** — for each fold, score train candidates with **`topstep_score * weight + avg_r * weight`** (`SCORING_WEIGHTS` in `config.py`); OOS gets **`attach_sequential_topstep_oos`** (sequential eval pass counts).
-  - **`_robust_params`** — picks parameters that meet **M-of-F** sequential-pass counts where possible.
-
-### Topstep rules
-
-- **`topstep.py`** implements Combine-style PnL path simulation: trailing drawdown floor (EOD ratchet), daily loss limit, profit target, consistency rule. **`count_sequential_eval_passes`** chains evals across calendar days on a single OOS trade list for walk-forward gates.
-- Rules and account shape live in **`TopStepRules`** / **`TOPSTEP_50K`** in **`config.py`** (adjust if your combine product differs).
-
-### Express funded reset simulation (holdout)
-
-- **`funded_express_sim.py`** runs a **multi-stint** Express-funded-style clock on **chronological** holdout fills: trailing max-loss (**EOD** ratchet unless the optional **floor lock** milestone engages), **`daily_loss_limit`** halts intra-day processing like the Combine simulator, **no** Combine profit/consistency early pass, breaches **reset** to `FundedExpressSimRules.account_size` and continue trades (same continuation rule as **`count_sequential_eval_passes`**: the termination **calendar day** is excluded from the next stint).
-- **Thresholds**: defaults live beside **`TOPSTEP_50K`** as **`FundedExpressSimRules`** / **`DEFAULT_FUNDED_EXPRESS_SIM`** (**`lock_trigger_balance`**, **`locked_floor_balance`**, **`max_drawdown`**, **`daily_loss_limit`**). Override in code when Topstep wording or product SKU differs.
-
-### Combine pass rate (sensitivity only)
-
-- **`combine_simulator.py`** groups trades **by calendar day**, shuffles **day order** many times, flattens to a synthetic timeline, runs **`simulate_topstep`** per draw → **`pass_rate_pct`**. This preserves daily-rule meaning (unlike shuffling individual trades for Topstep).
-
-### Parameter sensitivity
-
-- **`sensitivity.py`** — **`run_sensitivity`** compares each grid point’s **`pass_rate_pct`** to the baseline; **cliff** if a neighbor drops more than **`drop_threshold`** (default 25 percentage points).
-
-### Holdout Monte Carlo
-
-- **`holdout_monte_carlo.py`** shuffles **trades** and recomputes metrics — path dependence stress, **not** Combine pass probability.
-
-### Verdict and auxiliary ladder
-
-- **`verdict.py`** — **`compute_pipeline_verdict`** (what the CLI uses) and **`compute_verdict`** (threshold ladder on **`CombineSimResult`** — useful for tests / other tooling). Pipeline verdict keys off WF robustness, per-fold rate, cliff, holdout PnL, MC p05.
-
-### Immutability and audit
-
-- **`freeze.py`** — write `{strategy}_{timeframe}.json` under `frozen_params/` with params + **SHA-256**; refuse silent overwrites if hash changes (**`FrozenParamsViolation`**).
-- **`audit_stamp.py`** — `{strategy}_audit.json` + append **`audit_log.jsonl`** with verdict snapshot and param hash.
-
-### Windows without editing code
-
-- **`pipeline_config.py`** loads optional JSON: `in_sample_sanity`, `walk_forward` (list of train/test), `holdout` — same logical shape as `WINDOWS` in `config.py`.
-
-### Entry point
-
-- **`cli.py`** — argparse, stage orchestration, JSON export, printing summaries.
+```bash
+topstep-pipeline --strategy hl2_sma_retrace_atr --mode full
+topstep-pipeline --strategy hl2_sma_retrace_atr --mode holdout-only
+```
 
 ---
 
-## `src/v3/` file reference (brief)
+## Built-in Strategies
+
+| Key | Description |
+|---|---|
+| `connors_rsi2` | Connors RSI-2 mean reversion |
+| `ttm_squeeze` | TTM Squeeze momentum |
+| `orb_ib` | Opening range breakout (initial balance) |
+| `orb_volatility_filtered` | ORB with ATR volatility filter |
+| `orb_wick_rejection` | ORB with wick rejection confirmation |
+| `session_pivot_rejection` | Session pivot fade |
+| `session_pivot_break` | Session pivot breakout |
+| `hl2_sma_retrace_atr` | HL2 SMA retrace with ATR stops (user strategy) |
+
+---
+
+## Key CLI Flags
+
+| Flag | Default | Description |
+|---|---|---|
+| `--strategy` | required | Strategy key |
+| `--mode` | `quick` | `quick`, `full`, or `holdout-only` |
+| `--timeframe` | `5min` | Bar timeframe (matches CSV filename) |
+| `--eval-risk` | `500` | Dollars risked per trade before contract cap |
+| `--max-contracts` | `50` | Max contracts per signal |
+| `--min-wf-passes` | `2` | Min folds meeting sequential eval threshold (M-of-F) |
+| `--min-eval-passes-per-fold` | `2` | Min sequential Combine passes per qualifying fold |
+| `--min-fold-seq-pass-rate-pct` | `40.0` | Min sequential pass rate % per OOS fold |
+| `--holdout-mc-iterations` | `1000` | Block-bootstrap permutations for holdout MC2 |
+| `--mc-block-size` | `5` | Block size for block-bootstrap MC |
+| `--pipeline-config` | built-in | JSON file overriding WF and holdout date windows |
+| `--skip-wf` | off | Skip walk-forward; use `default_params` directly |
+| `--force` | off | Continue past WF gate failures (verdict may still REJECT) |
+| `--optimize-sizing-for-speed` | off | Find risk sizing for fastest Combine pass |
+| `--optimize-sizing-for-longevity` | off | Find risk sizing for max funded account longevity |
+| `--output-dir` | `output/` | Root for JSON, summaries, frozen params |
+| `--data-dir` | `Data/` | Directory containing MNQ CSV bundles |
+| `--topstep-weight` | `1.0` | Walk-forward scoring weight for topstep_score |
+| `--avg-r-weight` | `25.0` | Walk-forward scoring weight for avg_r |
+
+**Verdict threshold flags** (all overridable):
+`--reject-pass-rate`, `--reject-max-dd`, `--reject-daily-hit-pct`, `--reject-mean-dd`,
+`--ready-pass-rate`, `--ready-max-dd`, `--ready-daily-hit-pct`, `--ready-mean-dd`
+
+---
+
+## Contract / Sizing Optimizers
+
+Two optional post-evaluation stages in `position_sizing.py`. Both grid-search over risk levels ($50, $75, $100, $150, $200, $300, $400, $500 by default), resize all trades at each level, and rank candidates on a Pareto objective. Results saved to JSON in `output/`.
+
+### Speed Optimizer (`--optimize-sizing-for-speed`)
+
+**Goal:** find the risk-per-trade that gets you through the Topstep Combine fastest while staying above a minimum pass rate.
+
+Runs on each WF OOS fold after walk-forward. For each risk level it:
+1. Rescales trade P&L by the new contract count (via `_contracts_for_fixed_risk`)
+2. Runs `count_sequential_eval_passes` — the same sequential Combine eval used by walk-forward gates
+3. Collects `days_to_pass` from every passing eval attempt
+4. Filters out any risk level with `pass_rate < --pass-floor-pct` (default 40%)
+5. Ranks survivors by `mean_days_to_pass` ascending, then `pass_rate` descending
+6. Returns top 5 candidates + the optimal pick
+
+Output per WF fold: `output/<strategy>_wf<N>_speed_optimization.json`
+
+Key flags:
+| Flag | Default | Description |
+|---|---|---|
+| `--optimize-sizing-for-speed` | off | Enable speed optimizer on WF folds |
+| `--pass-floor-pct` | `40.0` | Min pass rate % to be a valid candidate |
+| `--pass-target-pct` | `75.0` | Target pass rate % (informational, logged only) |
+
+### Longevity Optimizer (`--optimize-sizing-for-longevity`)
+
+**Goal:** find the risk-per-trade that keeps a funded account alive the longest across the full holdout period.
+
+Runs once on holdout trades. For each risk level it:
+1. Rescales trade P&L by the new contract count
+2. Runs `simulate_express_funded_resets` — the same multi-stint funded account sim used in Stage 4
+3. Computes `avg_pnl_per_trade` across all stints
+4. Filters out any risk level below `--min-profit-per-trade` (default $150)
+5. Ranks survivors by `longevity_score` descending — defined as `funded_accounts_used + (accrued_pnl_bank / 50000)` — then by `avg_pnl_per_trade` descending
+6. Returns top 5 candidates + the optimal pick
+
+Output: `output/<strategy>_holdout_longevity_optimization.json`
+
+Key flags:
+| Flag | Default | Description |
+|---|---|---|
+| `--optimize-sizing-for-longevity` | off | Enable longevity optimizer on holdout |
+| `--min-profit-per-trade` | `150.0` | Min avg P&L per trade for a candidate to qualify |
+
+### Example — run both optimizers together
+
+```bash
+topstep-pipeline --strategy hl2_sma_retrace_atr --mode full \
+  --optimize-sizing-for-speed --pass-floor-pct 50 \
+  --optimize-sizing-for-longevity --min-profit-per-trade 200
+```
+
+---
+
+## Default Date Windows
+
+| Window | Start | End |
+|---|---|---|
+| WF1 train | 2022-09-01 | 2023-08-31 |
+| WF1 test | 2023-09-01 | 2024-02-29 |
+| WF2 train | 2022-09-01 | 2024-02-29 |
+| WF2 test | 2024-03-01 | 2024-08-31 |
+| Holdout | 2024-09-01 | 2026-03-18 |
+
+Override with `--pipeline-config config/your_windows.json`. See `config/README.md` for JSON schema.
+
+---
+
+## Verdict Logic
+
+**REJECT** if any of:
+- Combine pass rate < 50%
+- Max drawdown > $1,800
+- Daily loss limit hit rate > 60%
+- Average max drawdown > $1,200
+
+**COMBINE-READY** if all of:
+- Combine pass rate ≥ 75%
+- Max drawdown ≤ $1,400
+- Daily loss limit hit rate ≤ 25%
+- Average max drawdown ≤ $800
+
+Otherwise: **PROMISING**
+
+All thresholds are overridable via `--reject-*` / `--ready-*` CLI flags.
+
+---
+
+## Output Layout
+
+```
+output/
+  json/            <strategy>_<timeframe>_result.json    — full result bundle
+  txt summaries/   <strategy>_<timeframe>_result_summary.txt
+  graphs/          MC path plots, sensitivity heatmaps (.png)
+  frozen_params/   SHA-256 hashed param files + audit_log.jsonl
+```
+
+---
+
+## Instrument Defaults (MNQ)
+
+| Setting | Value |
+|---|---|
+| Point value | $2.00 |
+| Tick size | $0.25 |
+| Commission | $1.40 round-turn |
+| Slippage | 0.25 points per side |
+
+---
+
+## TopStep 50K Combine Rules (hardcoded defaults)
+
+| Rule | Value |
+|---|---|
+| Account size | $50,000 |
+| Profit target | $3,000 |
+| Max drawdown | $2,000 |
+| Daily loss limit | $1,000 |
+| Min trading days | 5 |
+| Max micro contracts | 50 |
+| Consistency rule | 50% of profit target max per day |
+
+---
+
+## Adding a Custom Strategy
+
+1. Create `src/v3/user_strategies/your_strategy.py`
+2. Define a `generate` function: `(df: pd.DataFrame, params: dict) -> list[TradeSignal]`
+3. Build a `StrategySpec` and call `register_strategy(spec)` at module load
+4. The pipeline auto-discovers all files in `user_strategies/` on startup
+
+See `src/v3/user_strategies/hl2_sma_retrace_atr.py` as a reference.
+
+---
+
+## Running Tests
+
+```bash
+pytest
+# or just the v3 suite
+python -m pytest tests/v3/ -q
+```
+
+---
+
+## Repository Layout
+
+| Path | Role |
+|---|---|
+| `src/v3/` | Package `v3`: backtest engine, Topstep rules, pipeline CLI |
+| `src/v3/user_strategies/` | Drop-in user strategy files (auto-loaded) |
+| `tests/` | Pytest suite |
+| `config/` | Optional JSON date windows (`--pipeline-config`) |
+| `scripts/` | Standalone utilities (e.g. result JSON summarizer) |
+| `run-cli.cmd` | Windows launcher (sets PYTHONPATH to this repo's src/) |
+| `pyproject.toml` | Build config and dependencies |
+
+`Data/`, `output/`, and `frozen_params/` are excluded from git. Do not force-add local run artifacts.
+
+---
+
+## `src/v3/` Module Reference
 
 | File | Responsibility |
-| ---- | ---------------- |
-| `__init__.py` | Package marker |
-| `cli.py` | Full pipeline CLI; stage order; result bundle |
-| `config.py` | Paths, session times, `WINDOWS`, `TopStepRules`, sizing defaults, scoring weights, verdict thresholds dataclass |
-| `pipeline_config.py` | Load/resolve optional JSON date windows |
-| `data.py` | Load/slice OHLCV |
+|---|---|
+| `cli.py` | Entry point — arg parsing and full 8-stage orchestration |
+| `config.py` | Paths, session times, `WINDOWS`, `TopStepRules`, MNQ constants, scoring weights, verdict thresholds |
+| `pipeline_config.py` | Load optional JSON date windows |
+| `data.py` | OHLCV CSV loader with session filtering |
 | `trades.py` | `TradeResult` dataclass |
-| `strategies.py` | Registered strategies + `StrategySpec` |
-| `indicators.py` | Indicator helpers |
-| `pivots.py` | Pivot levels for qualified strategies |
-| `validator.py` | Strategy validation and filter reference checks |
-| `evaluator.py` | Trade sim, metrics, WF, sequential OOS stats |
-| `topstep.py` | Combine simulation + sequential eval counting |
-| `funded_express_sim.py` | Holdout-funded multi-stint resets + Express-type floor milestones |
-| `combine_simulator.py` | Day-group bootstrap → Combine pass rate |
-| `sensitivity.py` | Param sweep + cliff detection |
-| `holdout_monte_carlo.py` | Trade-order permutation MC on holdout |
+| `strategies.py` | `StrategySpec` registry + all built-in strategies |
+| `indicators.py` | ATR, RSI, linreg, and other bar-level helpers |
+| `pivots.py` | Session pivot point calculations |
+| `validator.py` | Strategy spec validation and filter reference checks |
+| `evaluator.py` | Trade simulation, metrics, walk-forward runner, sequential OOS stats |
+| `topstep.py` | Combine simulation + sequential eval pass counting |
+| `funded_express_sim.py` | Multi-stint Express funded reset simulation on holdout trades |
+| `combine_simulator.py` | Day-group bootstrap → Combine pass rate (used by sensitivity) |
+| `sensitivity.py` | Param sweep, cliff detection, gradient heatmap |
+| `monte_carlo.py` | Block-bootstrap MC engine (shared by MC1 and MC2) |
+| `holdout_monte_carlo.py` | MC2 wrapper for holdout trades |
+| `regime_classifier.py` | Calm/volatile bar labeling + per-regime trade stats |
+| `position_sizing.py` | Speed (fastest Combine pass) and longevity sizing optimizers |
 | `verdict.py` | Pipeline and Combine-sim verdict helpers |
-| `freeze.py` | Frozen parameter snapshots + verification |
-| `audit_stamp.py` | Audit JSON + JSONL log |
-| `json_readable.py` | Result JSON → readable text (`pipeline` / `pretty`) |
-| `user_strategies/__init__.py` | Extension point for extra strategies |
-| `user_strategies/hl2_sma_retrace_atr.py` | Example HL2 SMA + ATR strategy |
-
----
-
-## `tests/v3/` (brief)
-
-| Test module | Focus |
-| ----------- | ----- |
-| `test_v3_setup.py` | Config, windows, strategy registry smoke tests |
-| `test_v3_evaluator.py` | Backtest and walk-forward behavior |
-| `test_v3_combine_simulator.py` | Day-group bootstrap + Topstep integration |
-| `test_json_readable.py` | Pretty / pipeline text export |
-| `test_funded_express_sim.py` | Express funded reset bookkeeping + milestones |
-| `test_v3_sensitivity.py` | Parameter cliff logic |
-| `test_v3_verdict.py` | Verdict thresholds |
-| `test_v3_validator.py` | Strategy validation |
-| `test_v3_freeze.py` | Frozen params |
-| `test_v3_audit_stamp.py` | Audit JSON + log |
-| `test_v3_cli.py` | CLI end-to-end with mocks |
-| `test_v3_scoring_weights.py` | Walk-forward scoring weights |
-| `test_v3_user_strategies.py` | Dynamic user strategy registration |
-
----
-
-## Design notes
-
-- **Two Monte Carlos, two questions:** (1) *Day-order* bootstrap + **`simulate_topstep`** → “Combine pass rate” (sensitivity). (2) *Trade-order* shuffle + **metrics** → “PnL/DD path luck” (holdout MC). Neither replaces the other.
-- **Combine vs funded reset:** evaluator paths still expose Combine **`simulate_topstep`** summaries; **`express_funded_reset_sim`** applies Express-style funded resets **only on the aggregated holdout list** JSON block (economics accumulate per stint closure).
-- **`--force`** can bypass some early exits; **verdict** may still reject downstream.
-- CLI **reject/ready threshold flags** are serialized into the result JSON; the **main pipeline verdict** (`compute_pipeline_verdict`) uses the staged gates described above — see `verdict.py` if you want to align those knobs.
+| `freeze.py` | Frozen parameter snapshots + SHA-256 verification |
+| `audit_stamp.py` | Audit JSON + JSONL append log |
+| `json_readable.py` | Result JSON → human-readable text export |
+| `user_strategies/hl2_sma_retrace_atr.py` | HL2 SMA retrace + ATR stop/target user strategy |

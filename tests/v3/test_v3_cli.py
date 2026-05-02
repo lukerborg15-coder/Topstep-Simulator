@@ -22,35 +22,27 @@ from v3.config import (
     PipelineWindows,
     WalkForwardWindow,
 )
+from v3.position_sizing import LongevityOptimizationResult, SpeedOptimizationResult
 from v3.strategies import STRATEGIES, StrategySpec, TradeSignal, load_user_strategies, register_strategy
+from v3.trades import TradeResult
 
 
 def _cli_e2e_result_json(output_dir: Path) -> Path:
     return output_dir / "json" / "cli_e2e_mock_5min_result.json"
 
 
+# Two-fold layout matching new WINDOWS default.
 NARROW_PIPELINE_WINDOWS = PipelineWindows(
-    in_sample_sanity=DateWindow("in_sample_sanity", "2024-06-03", "2024-06-14"),
     walk_forward=(
         WalkForwardWindow(
             "WF1",
             DateWindow("WF1_train", "2024-06-03", "2024-06-07"),
-            DateWindow("WF1_test", "2024-06-10", "2024-06-11"),
+            DateWindow("WF1_test", "2024-06-10", "2024-06-13"),
         ),
         WalkForwardWindow(
             "WF2",
-            DateWindow("WF2_train", "2024-06-03", "2024-06-11"),
-            DateWindow("WF2_test", "2024-06-12", "2024-06-13"),
-        ),
-        WalkForwardWindow(
-            "WF3",
-            DateWindow("WF3_train", "2024-06-03", "2024-06-13"),
-            DateWindow("WF3_test", "2024-06-14", "2024-06-17"),
-        ),
-        WalkForwardWindow(
-            "WF4",
-            DateWindow("WF4_train", "2024-06-03", "2024-06-17"),
-            DateWindow("WF4_test", "2024-06-18", "2024-06-21"),
+            DateWindow("WF2_train", "2024-06-03", "2024-06-13"),
+            DateWindow("WF2_test", "2024-06-14", "2024-06-21"),
         ),
     ),
     holdout=DateWindow("holdout", "2024-06-24", "2024-06-28"),
@@ -114,6 +106,7 @@ MOCK_CLI_SPEC = StrategySpec(
 def _fake_eval(
     *,
     trades: int = 24,
+    trade_results: list[TradeResult] | None = None,
     win_rate: float = 0.50,
     profit_factor: float = 1.50,
     topstep_passed: bool = True,
@@ -143,18 +136,22 @@ def _fake_eval(
             "seq_eval_passes": seq_eval_passes,
             "seq_eval_attempts": seq_eval_attempts,
         },
-        trades=[],
+        trades=[] if trade_results is None else trade_results,
     )
 
 
-def _patch_cli_wf_oos_four_folds(monkeypatch: pytest.MonkeyPatch, fold_factory=_fake_eval) -> None:
-    """Avoid running OOS re-eval on empty OHLCV in unit tests."""
+def _patch_cli_wf_oos_two_folds(monkeypatch: pytest.MonkeyPatch, fold_factory=_fake_eval) -> None:
+    """Avoid running OOS re-eval on empty OHLCV in unit tests (two-fold layout)."""
 
     monkeypatch.setattr(
         cli,
         "wf_oos_folds_for_selected_params",
-        lambda *a, **k: [fold_factory(window=f"WF{i}") for i in range(1, 5)],
+        lambda *a, **k: [fold_factory(window=f"WF{i}") for i in range(1, 3)],
     )
+
+
+# Backward-compat alias for tests that haven't been updated yet.
+_patch_cli_wf_oos_four_folds = _patch_cli_wf_oos_two_folds
 
 
 def _passing_combine() -> CombineSimResult:
@@ -174,6 +171,27 @@ def _passing_combine() -> CombineSimResult:
         n_trades=24,
         n_trading_days=6,
         n_resamples_requested=10,
+    )
+
+
+def _sizing_trade(net_pnl: float = 250.0) -> TradeResult:
+    return TradeResult(
+        strategy="cli_e2e_mock",
+        entry_time=pd.Timestamp("2024-06-10 09:35", tz=EASTERN_TZ),
+        exit_time=pd.Timestamp("2024-06-10 10:05", tz=EASTERN_TZ),
+        direction="long",
+        entry=18000.0,
+        stop=17995.0,
+        target=18015.0,
+        exit=18012.0,
+        contracts=2,
+        gross_pnl=net_pnl + 2.8,
+        commission=2.8,
+        net_pnl=net_pnl,
+        r_multiple=1.2,
+        exit_reason="target",
+        bars_held=6,
+        params=dict(MOCK_CLI_SPEC.default_params),
     )
 
 
@@ -296,7 +314,6 @@ def test_min_wf_passes_is_passed_to_walk_forward(
 ) -> None:
     captured: dict[str, Any] = {}
     monkeypatch.setattr(cli, "load_ohlcv", lambda **kwargs: pd.DataFrame())
-    monkeypatch.setattr(cli, "run_in_sample_sanity", lambda *args, **kwargs: _fake_eval())
     monkeypatch.setattr(cli, "evaluate_strategy", lambda *args, **kwargs: _fake_eval(window="holdout"))
     monkeypatch.setattr(cli, "run_combine_simulator", lambda *args, **kwargs: _passing_combine())
 
@@ -411,8 +428,8 @@ def test_pipeline_end_to_end_mock_strategy(
     result_json = _cli_e2e_result_json(output_dir)
     blob = json.loads(result_json.read_text())
     assert blob["skip_walk_forward"] is False
-    assert blob["walk_forward"]["aggregate"]["wf_folds"] == 4
-    assert len(blob["walk_forward"]["oos_folds"]) == 4
+    assert blob["walk_forward"]["aggregate"]["wf_folds"] == 2
+    assert len(blob["walk_forward"]["oos_folds"]) == 2
 
     verdict = blob["verdict"]["verdict"]
     assert verdict in {"REJECT", "PROMISING", "COMBINE-READY"}
@@ -422,6 +439,177 @@ def test_pipeline_end_to_end_mock_strategy(
         assert not (frozen_dir / "audit_log.jsonl").exists()
     else:
         assert (frozen_dir / "audit_log.jsonl").exists()
+
+
+def test_optimize_sizing_for_speed_writes_fold_json_and_console(
+    cli_mock_registered: None,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    captured_call: dict[str, Any] = {}
+    fold_trade = _sizing_trade()
+
+    monkeypatch.setattr(cli, "load_ohlcv", lambda **kwargs: pd.DataFrame())
+    monkeypatch.setattr(
+        cli,
+        "run_walk_forward",
+        lambda *args, **kwargs: (dict(MOCK_CLI_SPEC.default_params), [], True),
+    )
+    monkeypatch.setattr(
+        cli,
+        "wf_oos_folds_for_selected_params",
+        lambda *args, **kwargs: [_fake_eval(window="WF1_test", trade_results=[fold_trade])],
+    )
+    monkeypatch.setattr(cli, "evaluate_strategy", lambda *args, **kwargs: _fake_eval(window="holdout"))
+
+    def fake_optimize_for_speed_wf(*args: Any, **kwargs: Any) -> SpeedOptimizationResult:
+        captured_call["trades"] = args[0]
+        captured_call["strategy"] = kwargs["strategy"]
+        captured_call["window"] = kwargs["window"]
+        captured_call["pass_floor_pct"] = kwargs["pass_floor_pct"]
+        captured_call["pass_target_pct"] = kwargs["pass_target_pct"]
+        return SpeedOptimizationResult(
+            strategy=kwargs["strategy"],
+            window=kwargs["window"],
+            pass_floor_pct=kwargs["pass_floor_pct"],
+            pass_target_pct=kwargs["pass_target_pct"],
+            optimal_risk_dollars=150.0,
+            pass_rate_pct=68.5,
+            mean_days_to_pass=8.2,
+            std_days_to_pass=2.1,
+            min_contracts_used=2,
+            max_contracts_used=5,
+            candidates=(
+                {
+                    "risk_dollars": 150.0,
+                    "pass_rate_pct": 68.5,
+                    "mean_days_to_pass": 8.2,
+                    "std_days_to_pass": 2.1,
+                    "min_contracts": 2,
+                    "max_contracts": 5,
+                },
+                {
+                    "risk_dollars": 100.0,
+                    "pass_rate_pct": 65.0,
+                    "mean_days_to_pass": 9.1,
+                    "std_days_to_pass": 1.5,
+                    "min_contracts": 2,
+                    "max_contracts": 8,
+                },
+            ),
+        )
+
+    monkeypatch.setattr(cli, "optimize_for_speed_wf", fake_optimize_for_speed_wf)
+
+    output_dir = tmp_path / "out_sizing_speed"
+    code = cli.main(
+        [
+            "--strategy", "cli_e2e_mock",
+            "--timeframe", "5min",
+            "--data-dir", str(tmp_path),
+            "--output-dir", str(output_dir),
+            "--skip-sensitivity",
+            "--force",
+            "--optimize-sizing-for-speed",
+            "--pass-floor-pct", "45",
+            "--pass-target-pct", "80",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    out_json = output_dir / "cli_e2e_mock_wf1_speed_optimization.json"
+    payload = json.loads(out_json.read_text())
+
+    assert code == 0
+    assert captured_call == {
+        "trades": [fold_trade],
+        "strategy": "cli_e2e_mock",
+        "window": "WF1_test",
+        "pass_floor_pct": 45.0,
+        "pass_target_pct": 80.0,
+    }
+    assert payload["optimal_risk_dollars"] == 150.0
+    assert payload["candidates"][0]["risk_dollars"] == 150.0
+    assert "=== WF1_test Speed Optimization ===" in captured.out
+    assert "Optimal Risk: $150/trade" in captured.out
+    assert "1. $150  68.5%   8.2 days   2-5 contracts" in captured.out
+
+
+def test_optimize_sizing_for_longevity_writes_holdout_json_and_console(
+    cli_mock_registered: None,
+    synth_frame_narrow: pd.DataFrame,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    captured_call: dict[str, Any] = {}
+    holdout_trade = _sizing_trade(net_pnl=300.0)
+
+    monkeypatch.setattr(cli, "load_ohlcv", lambda **kwargs: synth_frame_narrow.copy())
+    monkeypatch.setattr(
+        cli,
+        "evaluate_strategy",
+        lambda *args, **kwargs: _fake_eval(window="holdout", trade_results=[holdout_trade]),
+    )
+
+    def fake_optimize_for_longevity_holdout(*args: Any, **kwargs: Any) -> LongevityOptimizationResult:
+        captured_call["trades"] = args[0]
+        captured_call["strategy"] = kwargs["strategy"]
+        captured_call["min_profit_per_trade"] = kwargs["min_profit_per_trade"]
+        return LongevityOptimizationResult(
+            strategy=kwargs["strategy"],
+            window=kwargs["window"],
+            min_profit_per_trade=kwargs["min_profit_per_trade"],
+            optimal_risk_dollars=200.0,
+            avg_pnl_per_trade=185.0,
+            total_pnl=18500.0,
+            funded_accounts_used=1,
+            accounts_blown=0,
+            total_trades_executed=100,
+            longevity_score=1.37,
+            candidates=(
+                {
+                    "risk_dollars": 200.0,
+                    "avg_pnl_per_trade": 185.0,
+                    "total_pnl": 18500.0,
+                    "funded_accounts_used": 1,
+                    "longevity_score": 1.37,
+                },
+            ),
+        )
+
+    monkeypatch.setattr(cli, "optimize_for_longevity_holdout", fake_optimize_for_longevity_holdout)
+
+    output_dir = tmp_path / "out_sizing_longevity"
+    code = cli.main(
+        [
+            "--strategy", "cli_e2e_mock",
+            "--timeframe", "5min",
+            "--data-dir", str(tmp_path),
+            "--output-dir", str(output_dir),
+            "--skip-wf",
+            "--skip-sensitivity",
+            "--optimize-sizing-for-longevity",
+            "--min-profit-per-trade", "175",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    out_json = output_dir / "cli_e2e_mock_holdout_longevity_optimization.json"
+    payload = json.loads(out_json.read_text())
+
+    assert code == 0
+    assert captured_call == {
+        "trades": [holdout_trade],
+        "strategy": "cli_e2e_mock",
+        "min_profit_per_trade": 175.0,
+    }
+    assert payload["optimal_risk_dollars"] == 200.0
+    assert payload["candidates"][0]["avg_pnl_per_trade"] == 185.0
+    assert "=== Holdout Longevity Optimization ===" in captured.out
+    assert "Optimal Risk: $200/trade" in captured.out
+    assert "1. $200   $185/trade   1 account   score=1.37" in captured.out
 
 
 # ---------------------------------------------------------------------------
@@ -462,16 +650,22 @@ def test_skip_sensitivity_flag_omits_sensitivity_from_result(
     assert "Skipped: --skip-sensitivity flag" in captured.out
 
 
-def test_stage_2_rejects_insufficient_sample_size(
+def test_wf_gate_exits_before_holdout_without_force(
     cli_mock_registered: None,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
+    """WF gate failure (no --force) should exit before holdout stage."""
     monkeypatch.setattr(cli, "load_ohlcv", lambda **kwargs: pd.DataFrame())
-    monkeypatch.setattr(cli, "run_in_sample_sanity", lambda *args, **kwargs: _fake_eval(trades=5))
+    monkeypatch.setattr(cli, "run_walk_forward", lambda *args, **kwargs: (
+        dict(MOCK_CLI_SPEC.default_params),
+        [_fake_eval(topstep_passed=False, window=f"WF{i}") for i in range(1, 3)],
+        False,
+    ))
+    _patch_cli_wf_oos_two_folds(monkeypatch)
 
-    output_dir = tmp_path / "out_stage2_reject"
+    output_dir = tmp_path / "out_wf_gate_early_exit"
     code = cli.main(
         [
             "--strategy", "cli_e2e_mock",
@@ -483,8 +677,8 @@ def test_stage_2_rejects_insufficient_sample_size(
 
     captured = capsys.readouterr()
     assert code == 1
-    assert "REJECT: insufficient sample size" in captured.out
-    assert "Stage 3" not in captured.out
+    assert "REJECT: walk-forward gates not met" in captured.err
+    assert "Stage 4" not in captured.out
     assert not (output_dir / "frozen_params").exists()
 
 
@@ -495,7 +689,7 @@ def test_wf_robust_fail_exits_before_later_stages_without_force(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     monkeypatch.setattr(cli, "load_ohlcv", lambda **kwargs: pd.DataFrame())
-    monkeypatch.setattr(cli, "run_in_sample_sanity", lambda *args, **kwargs: _fake_eval())
+
     monkeypatch.setattr(cli, "run_walk_forward", lambda *args, **kwargs: (
         dict(MOCK_CLI_SPEC.default_params),
         [_fake_eval(topstep_passed=False, window=f"WF{i}") for i in range(1, 5)],
@@ -529,7 +723,7 @@ def test_wf_robust_fail_continues_with_force(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     monkeypatch.setattr(cli, "load_ohlcv", lambda **kwargs: pd.DataFrame())
-    monkeypatch.setattr(cli, "run_in_sample_sanity", lambda *args, **kwargs: _fake_eval())
+
     monkeypatch.setattr(cli, "run_walk_forward", lambda *args, **kwargs: (
         dict(MOCK_CLI_SPEC.default_params),
         [_fake_eval(topstep_passed=False, window=f"WF{i}") for i in range(1, 5)],
@@ -563,7 +757,7 @@ def test_wf_seq_pass_rate_fail_exits_without_force(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     monkeypatch.setattr(cli, "load_ohlcv", lambda **kwargs: pd.DataFrame())
-    monkeypatch.setattr(cli, "run_in_sample_sanity", lambda *args, **kwargs: _fake_eval())
+
     monkeypatch.setattr(
         cli,
         "run_walk_forward",
@@ -602,7 +796,7 @@ def test_strict_flag_does_not_bypass_wf_gate(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     monkeypatch.setattr(cli, "load_ohlcv", lambda **kwargs: pd.DataFrame())
-    monkeypatch.setattr(cli, "run_in_sample_sanity", lambda *args, **kwargs: _fake_eval())
+
     monkeypatch.setattr(cli, "run_walk_forward", lambda *args, **kwargs: (
         dict(MOCK_CLI_SPEC.default_params),
         [_fake_eval(topstep_passed=False, window=f"WF{i}") for i in range(1, 5)],
@@ -634,7 +828,7 @@ def test_reject_verdict_does_not_freeze(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     monkeypatch.setattr(cli, "load_ohlcv", lambda **kwargs: pd.DataFrame())
-    monkeypatch.setattr(cli, "run_in_sample_sanity", lambda *args, **kwargs: _fake_eval())
+
     monkeypatch.setattr(
         cli,
         "run_walk_forward",
@@ -674,7 +868,7 @@ def test_verdict_threshold_cli_args_persist_in_result_bundle(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     monkeypatch.setattr(cli, "load_ohlcv", lambda **kwargs: pd.DataFrame())
-    monkeypatch.setattr(cli, "run_in_sample_sanity", lambda *args, **kwargs: _fake_eval())
+
     monkeypatch.setattr(cli, "evaluate_strategy", lambda *args, **kwargs: _fake_eval(window="holdout"))
 
     output_dir = Path(".pytest_cache") / "out_cli_thresholds"

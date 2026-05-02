@@ -17,9 +17,9 @@ from v3.evaluator import (
     compute_metrics,
     evaluate_strategy,
     fold_seq_eval_pass_rate,
-    run_in_sample_sanity,
     run_walk_forward,
     simulate_trades,
+    walk_forward_development_window,
 )
 from v3.strategies import STRATEGIES, StrategySpec, TradeSignal
 from v3.trades import TradeResult
@@ -429,17 +429,14 @@ def test_evaluate_strategy_attaches_pivots_for_builtin_pivot_strategy() -> None:
     assert result.trades[0].entry_time == pd.Timestamp("2024-01-02 10:05", tz=EASTERN_TZ)
 
 
-def test_run_in_sample_sanity_uses_in_sample_window(monkeypatch: Any) -> None:
-    _install_unit_strategy(monkeypatch)
-    frame = _synthetic_ohlcv()
-
-    result = run_in_sample_sanity(frame, "unit_eval", "1d")
-
-    assert result.window == WINDOWS.in_sample_sanity.name
-    assert result.params == STRATEGIES["unit_eval"].default_params
-    assert result.combine_sim is None
-    assert result.trades
-    assert all(WINDOWS.in_sample_sanity.start <= str(trade.entry_time.date()) <= WINDOWS.in_sample_sanity.end for trade in result.trades)
+def test_walk_forward_development_window_returns_correct_bounds() -> None:
+    dev = walk_forward_development_window(WINDOWS)
+    # Start = min of all train.start; end = max of all test.end
+    expected_start = min(wf.train.start for wf in WINDOWS.walk_forward)
+    expected_end = max(wf.test.end for wf in WINDOWS.walk_forward)
+    assert dev.start == expected_start
+    assert dev.end == expected_end
+    assert dev.name == "wf_development"
 
 
 def test_run_walk_forward_returns_one_oos_result_per_fold(monkeypatch: Any) -> None:
@@ -450,7 +447,7 @@ def test_run_walk_forward_returns_one_oos_result_per_fold(monkeypatch: Any) -> N
 
     assert best_params
     assert wf_ok in (True, False)
-    assert len(folds) == len(WINDOWS.walk_forward) == 4
+    assert len(folds) == len(WINDOWS.walk_forward) == 2
     assert [fold.window for fold in folds] == [wf.test.name for wf in WINDOWS.walk_forward]
     assert all(isinstance(fold, EvaluationResult) for fold in folds)
 
@@ -485,10 +482,9 @@ def test_run_walk_forward_scores_with_avg_r_bonus_and_returns_param_mode(monkeyp
             if params["label"] == "topstep_only":
                 topstep_score = 100.0
             elif params["label"] == "mode_candidate":
+                # score = 80*1 + 1*25 = 105 > 100 -> wins both folds
                 topstep_score = 80.0
                 avg_r = 1.0
-            elif window.name == "WF4_train":
-                topstep_score = 200.0
 
         return EvaluationResult(
             strategy=strategy_name,
@@ -507,8 +503,6 @@ def test_run_walk_forward_scores_with_avg_r_bonus_and_returns_param_mode(monkeyp
     assert [fold.params["label"] for fold in folds] == [
         "mode_candidate",
         "mode_candidate",
-        "mode_candidate",
-        "rare_candidate",
     ]
     assert wf_ok is False  # empty OOS trades -> seq passes 0 -> fallback
 
@@ -583,7 +577,7 @@ def test_aggregate_wf_metrics_returns_required_keys(monkeypatch: Any) -> None:
     metrics = aggregate_wf_metrics(folds)
 
     assert REQUIRED_WF_KEYS == set(metrics)
-    assert metrics["wf_folds"] == 4
+    assert metrics["wf_folds"] == 2
 
 
 def test_aggregate_wf_metrics_calculates_summary_values() -> None:

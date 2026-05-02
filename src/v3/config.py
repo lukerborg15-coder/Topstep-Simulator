@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Optional
 
 EASTERN_TZ = "America/New_York"
 SESSION_START = "09:30"
@@ -47,37 +48,35 @@ class WalkForwardWindow:
 
 @dataclass(frozen=True)
 class PipelineWindows:
-    in_sample_sanity: DateWindow
     walk_forward: tuple[WalkForwardWindow, ...]
     holdout: DateWindow
+    in_sample_sanity: Optional[DateWindow] = field(default=None)
 
 
+# Two expanding WF folds; in_sample_sanity removed — OOS replaces it.
+# WF1 test covers 6 months; WF2 test covers remaining 6 months before holdout.
+# holdout unchanged: 2024-09-01 → 2026-03-18.
 WINDOWS = PipelineWindows(
-    in_sample_sanity=DateWindow("in_sample_sanity", "2022-09-01", "2024-08-31"),
     walk_forward=(
         WalkForwardWindow(
             "WF1",
             DateWindow("WF1_train", "2022-09-01", "2023-08-31"),
-            DateWindow("WF1_test", "2023-09-01", "2023-11-30"),
+            DateWindow("WF1_test", "2023-09-01", "2024-02-29"),
         ),
         WalkForwardWindow(
             "WF2",
-            DateWindow("WF2_train", "2022-09-01", "2023-11-30"),
-            DateWindow("WF2_test", "2023-12-01", "2024-02-29"),
-        ),
-        WalkForwardWindow(
-            "WF3",
-            DateWindow("WF3_train", "2022-09-01", "2024-02-29"),
-            DateWindow("WF3_test", "2024-03-01", "2024-05-31"),
-        ),
-        WalkForwardWindow(
-            "WF4",
-            DateWindow("WF4_train", "2022-09-01", "2024-05-31"),
-            DateWindow("WF4_test", "2024-06-01", "2024-08-31"),
+            DateWindow("WF2_train", "2022-09-01", "2024-02-29"),
+            DateWindow("WF2_test", "2024-03-01", "2024-08-31"),
         ),
     ),
     holdout=DateWindow("holdout", "2024-09-01", "2026-03-18"),
 )
+
+
+# MC defaults — override via CLI args.
+DEFAULT_MC_BLOCK_SIZE: int = 5
+DEFAULT_MC_N_PERMS: int = 1000
+DEFAULT_MC_CI_PCT: float = 95.0
 
 
 @dataclass(frozen=True)

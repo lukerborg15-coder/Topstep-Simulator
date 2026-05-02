@@ -15,14 +15,10 @@ __all__ = [
 
 
 def json_object_to_readable_text(obj: Any, *, indent: int = 2) -> str:
-    """Format any JSON-serializable value as indented text (uses ``default=str`` for odd types)."""
-
     return json.dumps(obj, indent=indent, sort_keys=False, ensure_ascii=False, default=str) + "\n"
 
 
 def format_titled_json_block(title: str, data: Any, *, indent: int = 2) -> str:
-    """Wrap a title and pretty JSON body in separators."""
-
     sep = "=" * 72
     body = json.dumps(data, indent=indent, sort_keys=False, ensure_ascii=False, default=str)
     return f"{sep}\n{title}\n{sep}\n{body}\n\n"
@@ -30,7 +26,7 @@ def format_titled_json_block(title: str, data: Any, *, indent: int = 2) -> str:
 
 def _strip_trades(obj: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(obj, dict):
-        return obj  # pragma: no cover
+        return obj
     out = {k: v for k, v in obj.items() if k != "trades"}
     if "trades" in obj and isinstance(obj["trades"], list):
         out["trade_count"] = len(obj["trades"])
@@ -38,10 +34,7 @@ def _strip_trades(obj: dict[str, Any]) -> dict[str, Any]:
 
 
 def pipeline_result_bundle_to_readable_text(data: dict[str, Any]) -> str:
-    """Turn a ``v3.cli`` result-bundle dict into staged human-readable blocks (trade arrays omitted).
-
-    Mirrors the historical ``scripts/summarize_result_json.py`` layout.
-    """
+    """Turn a v3.cli result-bundle dict into staged human-readable blocks."""
 
     parts: list[str] = []
 
@@ -59,33 +52,41 @@ def pipeline_result_bundle_to_readable_text(data: dict[str, Any]) -> str:
             "skip_sensitivity",
             "sizing",
             "min_fold_seq_pass_rate_pct",
+            "wf_development_window",
         )
         if k in data
     }
     parts.append(format_titled_json_block("RUN INPUTS / METADATA", meta))
     parts.append(format_titled_json_block("STAGE 1 — validate", data.get("stage_validate")))
 
-    if "in_sample_sanity" in data:
-        parts.append(
-            format_titled_json_block(
-                "STAGE 2 — in-sample sanity (trade list omitted)",
-                _strip_trades(data["in_sample_sanity"]),
-            )
-        )
-
     if "walk_forward" in data and isinstance(data["walk_forward"], dict):
         wf = dict(data["walk_forward"])
         oos = wf.get("oos_folds")
         if isinstance(oos, list):
             wf["oos_folds"] = [_strip_trades(x) if isinstance(x, dict) else x for x in oos]
-        parts.append(format_titled_json_block("STAGE 3 — walk-forward (oos trade lists omitted)", wf))
+        parts.append(format_titled_json_block("STAGE 2 — walk-forward (oos trade lists omitted)", wf))
 
-    parts.append(format_titled_json_block("STAGE 4 — sensitivity", data.get("sensitivity")))
+    if "sensitivity" in data and data["sensitivity"] is not None:
+        sens = dict(data["sensitivity"])
+        sens.pop("sensitivity_param_results", None)
+        parts.append(format_titled_json_block("STAGE 3 — sensitivity (param sweep summary)", sens))
+        if "sensitivity_heatmap_text" in data.get("sensitivity", {}):
+            parts.append(
+                format_titled_json_block(
+                    "STAGE 3 — sensitivity gradient text",
+                    data["sensitivity"]["sensitivity_heatmap_text"],
+                )
+            )
+    else:
+        parts.append(format_titled_json_block("STAGE 3 — sensitivity", data.get("sensitivity")))
+
+    if "sensitivity_mc" in data and data["sensitivity_mc"] is not None:
+        parts.append(format_titled_json_block("STAGE 3 — sensitivity MC1 (block bootstrap)", data.get("sensitivity_mc")))
 
     if "holdout" in data:
         parts.append(
             format_titled_json_block(
-                "STAGE 5 — holdout (trade list omitted)",
+                "STAGE 4 — holdout (trade list omitted)",
                 _strip_trades(data["holdout"]),
             )
         )
@@ -93,20 +94,38 @@ def pipeline_result_bundle_to_readable_text(data: dict[str, Any]) -> str:
     if "express_funded_reset_sim" in data:
         parts.append(
             format_titled_json_block(
-                "HOLDOUT — Express funded reset sim (milestones / bank across breaches)",
+                "STAGE 4 — Express funded reset sim (milestones / bank across breaches)",
                 data.get("express_funded_reset_sim"),
             )
         )
 
-    parts.append(format_titled_json_block("STAGE 6 — holdout Monte Carlo (trade-order)", data.get("holdout_monte_carlo")))
+    if "holdout_monte_carlo" in data:
+        ho_mc = dict(data["holdout_monte_carlo"]) if isinstance(data["holdout_monte_carlo"], dict) else data["holdout_monte_carlo"]
+        parts.append(format_titled_json_block("STAGE 5 — holdout Monte Carlo MC2 (block bootstrap)", ho_mc))
+
+    if "regime_fit" in data:
+        parts.append(format_titled_json_block("STAGE 6 — regime fit", data.get("regime_fit")))
+
     parts.append(format_titled_json_block("STAGE 7 — verdict", data.get("verdict")))
     parts.append(format_titled_json_block("VERDICT THRESHOLDS (CLI)", data.get("verdict_thresholds")))
     parts.append(format_titled_json_block("STAGE 8 — freeze / audit", data.get("freeze")))
+
+    # Graph paths summary
+    graph_paths: list[str] = []
+    if isinstance(data.get("sensitivity_mc"), dict) and data["sensitivity_mc"].get("graph_path"):
+        graph_paths.append(f"Sensitivity MC paths: {data['sensitivity_mc']['graph_path']}")
+    if isinstance(data.get("sensitivity"), dict) and data["sensitivity"].get("sensitivity_heatmap_path"):
+        graph_paths.append(f"Sensitivity heatmap: {data['sensitivity']['sensitivity_heatmap_path']}")
+    if isinstance(data.get("holdout_monte_carlo"), dict) and data["holdout_monte_carlo"].get("graph_path"):
+        graph_paths.append(f"Holdout MC paths: {data['holdout_monte_carlo']['graph_path']}")
+    if graph_paths:
+        parts.append("\nGraphs generated:\n" + "\n".join(f"  {p}" for p in graph_paths) + "\n")
 
     parts.append(
         "\nNotes:\n"
         "- Full fills and outcomes are still in the .json inside `trades` arrays.\n"
         "- WF OOS summaries above include `trade_count` per fold instead of listing trades.\n"
+        "- Stage 2 in-sample sanity removed; WF development window covers full pre-holdout calendar.\n"
     )
 
     return "".join(parts)
@@ -118,16 +137,6 @@ def write_readable_text_from_json_file(
     *,
     style: str = "pipeline",
 ) -> Path:
-    """Read a JSON file, format it, write UTF-8 text.
-
-    Args:
-        json_path: Path to `.json`.
-        output_path: Target `.txt` path. If omitted, uses ``<stem>_summary.txt`` (pipeline) or
-            ``<stem>_readable.txt`` (pretty).
-        style: ``"pipeline"`` — ``pipeline_result_bundle_to_readable_text`` when root is an object,
-            indent-staged summaries and strip trade spam. ``"pretty"`` —whole file as one indented JSON tree.
-    """
-
     in_path = Path(json_path)
     payload: Any = json.loads(in_path.read_text(encoding="utf-8"))
 

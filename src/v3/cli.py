@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from dataclasses import asdict
 from pathlib import Path
@@ -14,6 +15,9 @@ from .config import (
     DEFAULT_DATA_DIR,
     DEFAULT_FUNDED_EXPRESS_SIM,
     DEFAULT_MAX_CONTRACTS,
+    DEFAULT_MC_BLOCK_SIZE,
+    DEFAULT_MC_CI_PCT,
+    DEFAULT_MC_N_PERMS,
     DEFAULT_MIN_FOLD_SEQ_PASS_RATE_PCT,
     DEFAULT_RISK_DOLLARS,
     DEFAULT_STRICT_WF_GATE,
@@ -28,18 +32,32 @@ from .evaluator import (
     aggregate_wf_metrics,
     all_folds_meet_min_seq_pass_rate,
     evaluate_strategy,
-    run_in_sample_sanity,
     run_walk_forward,
+    walk_forward_development_window,
     wf_oos_folds_for_selected_params,
 )
 from .freeze import freeze_params
 from .funded_express_sim import express_funded_reset_sim_summary_dict, simulate_express_funded_resets
+from .holdout_monte_carlo import (
+    holdout_monte_carlo_summary_dict,
+    plot_holdout_mc_paths,
+    run_holdout_trade_monte_carlo,
+)
 from .json_readable import write_readable_text_from_json_file
-from .holdout_monte_carlo import holdout_monte_carlo_summary_dict, run_holdout_trade_monte_carlo
+from .monte_carlo import MCResult, mc_summary_dict, mc_summary_text, plot_mc_paths, run_mc
 from .pipeline_config import resolve_windows
+from .position_sizing import (
+    LongevityOptimizationResult,
+    SpeedOptimizationResult,
+    optimize_for_longevity_holdout,
+    optimize_for_speed_wf,
+)
+from .regime_classifier import classify_regime_fit, regime_summary_dict, regime_summary_text
 from .sensitivity import (
     SensitivityReport,
+    plot_sensitivity_heatmap,
     run_sensitivity,
+    sensitivity_heatmap_text,
     sensitivity_summary_dict,
 )
 from .strategies import STRATEGIES, load_user_strategies
@@ -49,16 +67,18 @@ from .verdict import compute_pipeline_verdict, verdict_summary_dict
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Topstep evaluation pipeline (backtest → WF → sensitivity → holdout → MC → verdict).")
+    parser = argparse.ArgumentParser(
+        description="Topstep evaluation pipeline (validate → WF → sensitivity → holdout → MC → regime → verdict)."
+    )
     parser.add_argument("--strategy", default=None, help="Registered strategy key (required unless --list-strategies).")
     parser.add_argument(
         "--mode",
         choices=["quick", "full", "holdout-only"],
         default="quick",
         help=(
-            "Pipeline mode: quick: stages 1→3 then 5→8 (skip stage 4 parameter sensitivity). ~12 min. "
-            "full: all stages 1→8 including sensitivity. holdout-only: 1→2 then 5→8 "
-            "(frozen/default params; skips walk-forward and sensitivity). ~2 min."
+            "Pipeline mode: quick: stages 1→2 then 4→7 (skip stage 3 parameter sensitivity). "
+            "full: all stages 1→7 including sensitivity. holdout-only: 1→2 then 4→7 "
+            "(frozen/default params; skips walk-forward and sensitivity)."
         ),
     )
     parser.add_argument("--timeframe", default="5min", help="Bar timeframe suffix (matches data file naming).")
@@ -78,10 +98,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--pipeline-config",
         default=None,
-        help="JSON file with in_sample_sanity, walk_forward, holdout windows (see config/ in project root).",
+        help="JSON file with walk_forward and holdout windows (see config/ in project root).",
     )
-    parser.add_argument("--holdout-mc-iterations", type=int, default=1000, help="Holdout trade-order shuffles (Monte Carlo v1).")
+    parser.add_argument("--holdout-mc-iterations", type=int, default=DEFAULT_MC_N_PERMS, help="Holdout trade-order block-bootstrap permutations (MC2). Default 1000.")
     parser.add_argument("--holdout-mc-seed", type=int, default=42, help="RNG seed for holdout Monte Carlo.")
+    parser.add_argument("--mc-block-size", type=int, default=DEFAULT_MC_BLOCK_SIZE, help=f"Block size for block-bootstrap MC (default {DEFAULT_MC_BLOCK_SIZE}).")
+    parser.add_argument("--mc-ci-pct", type=float, default=DEFAULT_MC_CI_PCT, help=f"Confidence interval percentage for MC (default {DEFAULT_MC_CI_PCT}).")
     parser.add_argument("--topstep-weight", type=float, default=1.0, help="Weight for Topstep score in walk-forward selection (default 1.0)")
     parser.add_argument("--avg-r-weight", type=float, default=25.0, help="Weight for avg_r in walk-forward selection (default 25.0)")
     parser.add_argument("--data-dir", default=str(DEFAULT_DATA_DIR), help="Directory containing MNQ_* CSV bundles.")
@@ -115,14 +137,16 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_MIN_FOLD_SEQ_PASS_RATE_PCT,
         help=(
             "Each OOS fold (selected params) must have seq_eval_passes/seq_eval_attempts "
-            f"≥ this %% (default {DEFAULT_MIN_FOLD_SEQ_PASS_RATE_PCT}); attempts==0 fails the fold."
+            f">= this %% (default {DEFAULT_MIN_FOLD_SEQ_PASS_RATE_PCT}); attempts==0 fails the fold."
         ),
     )
     sensitivity_group = parser.add_mutually_exclusive_group()
     sensitivity_group.add_argument("--full", dest="skip_sensitivity", action="store_false", help="Run full pipeline, including the optional sensitivity sweep.")
-    sensitivity_group.add_argument("--skip-sensitivity", dest="skip_sensitivity", action="store_true", help="Skip parameter sensitivity (stage 4).")
+    sensitivity_group.add_argument("--skip-sensitivity", dest="skip_sensitivity", action="store_true", help="Skip parameter sensitivity (stage 3).")
     parser.set_defaults(skip_sensitivity=None)
     parser.add_argument("--sensitivity-resamples", type=int, default=200, help="Bootstrap iterations per sensitivity sweep point (default 200).")
+    parser.add_argument("--sensitivity-mc-iterations", type=int, default=DEFAULT_MC_N_PERMS, help="Block-bootstrap permutations for sensitivity MC1 (default 1000).")
+    parser.add_argument("--sensitivity-mc-seed", type=int, default=99, help="RNG seed for sensitivity MC1 (default 99).")
     parser.add_argument("--reject-pass-rate", type=float, default=VERDICT_THRESHOLDS.reject_pass_rate_pct, help="Reject if Combine pass rate is below this percentage.")
     parser.add_argument("--reject-max-dd", type=float, default=VERDICT_THRESHOLDS.reject_max_dd, help="Reject if worst-case drawdown exceeds this dollar amount.")
     parser.add_argument("--reject-daily-hit-pct", type=float, default=VERDICT_THRESHOLDS.reject_daily_hit_pct, help="Reject if daily loss limit hit rate exceeds this percentage.")
@@ -131,6 +155,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ready-max-dd", type=float, default=VERDICT_THRESHOLDS.ready_max_dd, help="Require worst-case drawdown at or below this dollar amount for COMBINE-READY.")
     parser.add_argument("--ready-daily-hit-pct", type=float, default=VERDICT_THRESHOLDS.ready_daily_hit_pct, help="Require daily loss limit hit rate at or below this percentage for COMBINE-READY.")
     parser.add_argument("--ready-mean-dd", type=float, default=VERDICT_THRESHOLDS.ready_mean_dd, help="Require average max drawdown at or below this dollar amount for COMBINE-READY.")
+    parser.add_argument("--optimize-sizing-for-speed", action="store_true", help="Run walk-forward fold sizing optimization for fastest Combine pass.")
+    parser.add_argument("--pass-floor-pct", type=float, default=40.0, help="Minimum pass rate percentage for walk-forward speed sizing candidates (default 40).")
+    parser.add_argument("--pass-target-pct", type=float, default=75.0, help="Target pass rate percentage for walk-forward speed sizing reporting (default 75).")
+    parser.add_argument("--optimize-sizing-for-longevity", action="store_true", help="Run holdout sizing optimization for funded-account longevity.")
+    parser.add_argument("--min-profit-per-trade", type=float, default=150.0, help="Minimum average P&L per trade for holdout longevity sizing candidates (default 150).")
     return parser
 
 
@@ -139,8 +168,6 @@ def _apply_mode_defaults(args: argparse.Namespace) -> None:
         args.skip_sensitivity = args.mode != "full"
     if args.mode == "holdout-only":
         args.skip_wf = True
-
-    # --skip-sensitivity and --skip-wf can still be set individually for power users.
 
 
 def _trade_json(trade: TradeResult) -> dict[str, Any]:
@@ -195,6 +222,87 @@ def _print_summary_table(rows: list[tuple[str, str]]) -> None:
         print(f"{key.ljust(key_w)} | {val}")
 
 
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    return value
+
+
+def _write_optimization_json(path: Path, result: SpeedOptimizationResult | LongevityOptimizationResult) -> None:
+    payload = _json_safe(asdict(result))
+    path.write_text(json.dumps(payload, indent=2, sort_keys=False, default=str) + "\n")
+
+
+def _money(value: float) -> str:
+    return f"${value:,.0f}"
+
+
+def _contracts_range(min_contracts: int, max_contracts: int) -> str:
+    return f"{min_contracts}-{max_contracts}"
+
+
+def _print_speed_optimization(result: SpeedOptimizationResult) -> None:
+    print()
+    print(f"=== {result.window} Speed Optimization ===")
+    if result.optimal_risk_dollars <= 0:
+        print("Optimal Risk: n/a")
+        print(f"Pass Rate: {result.pass_rate_pct:.1f}%")
+        print("Mean Days to Pass: n/a")
+        print("Contracts: n/a")
+    else:
+        print(f"Optimal Risk: {_money(result.optimal_risk_dollars)}/trade")
+        print(f"Pass Rate: {result.pass_rate_pct:.1f}%")
+        print(f"Mean Days to Pass: {result.mean_days_to_pass:.1f} ± {result.std_days_to_pass:.1f}")
+        print(f"Contracts: {_contracts_range(result.min_contracts_used, result.max_contracts_used)}")
+    print()
+    print("Top 5:")
+    if not result.candidates:
+        print("(no candidates)")
+        return
+    for idx, candidate in enumerate(result.candidates[:5], 1):
+        mean_days = candidate.get("mean_days_to_pass")
+        mean_s = (
+            "n/a"
+            if mean_days is None or not math.isfinite(float(mean_days))
+            else f"{float(mean_days):.1f} days"
+        )
+        print(
+            f"{idx}. {_money(float(candidate['risk_dollars']))}  "
+            f"{float(candidate['pass_rate_pct']):.1f}%   {mean_s}   "
+            f"{_contracts_range(int(candidate.get('min_contracts', 0)), int(candidate.get('max_contracts', 0)))} contracts"
+        )
+
+
+def _print_longevity_optimization(result: LongevityOptimizationResult) -> None:
+    print()
+    print("=== Holdout Longevity Optimization ===")
+    if result.optimal_risk_dollars <= 0:
+        print("Optimal Risk: n/a")
+    else:
+        print(f"Optimal Risk: {_money(result.optimal_risk_dollars)}/trade")
+    print(f"Avg P&L per Trade: {_money(result.avg_pnl_per_trade)}")
+    print(f"Total P&L: {_money(result.total_pnl)}")
+    print(f"Accounts Used: {result.funded_accounts_used}")
+    print(f"Longevity Score: {result.longevity_score:.2f}")
+    print()
+    print("Top 5:")
+    if not result.candidates:
+        print("(no candidates)")
+        return
+    for idx, candidate in enumerate(result.candidates[:5], 1):
+        accounts = int(candidate.get("funded_accounts_used", 0))
+        account_word = "account" if accounts == 1 else "accounts"
+        print(
+            f"{idx}. {_money(float(candidate['risk_dollars']))}   "
+            f"{_money(float(candidate['avg_pnl_per_trade']))}/trade   "
+            f"{accounts} {account_word}   score={float(candidate['longevity_score']):.2f}"
+        )
+
+
 def _resolve_frozen_dir(output_dir: Path, frozen_explicit: Path | None) -> Path:
     default = Path(output_dir) / "frozen_params"
     return default if frozen_explicit is None else Path(frozen_explicit)
@@ -226,6 +334,12 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--max-contracts must be >= 1")
     if not (0.0 < args.min_fold_seq_pass_rate_pct <= 100.0):
         parser.error("--min-fold-seq-pass-rate-pct must be in (0, 100]")
+    if not (0.0 <= args.pass_floor_pct <= 100.0):
+        parser.error("--pass-floor-pct must be in [0, 100]")
+    if not (0.0 <= args.pass_target_pct <= 100.0):
+        parser.error("--pass-target-pct must be in [0, 100]")
+    if args.min_profit_per_trade < 0:
+        parser.error("--min-profit-per-trade must be >= 0")
     if args.topstep_weight != 1.0 or args.avg_r_weight != 25.0:
         evaluator_module.SCORING_WEIGHTS = ScoringWeights(
             topstep_weight=args.topstep_weight,
@@ -254,6 +368,8 @@ def main(argv: list[str] | None = None) -> int:
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    graphs_dir = output_dir / "graphs"
+    graphs_dir.mkdir(parents=True, exist_ok=True)
     frozen_explicit = Path(args.frozen_params_dir).resolve() if args.frozen_params_dir else None
     frozen_root = _resolve_frozen_dir(output_dir, frozen_explicit)
 
@@ -273,45 +389,10 @@ def main(argv: list[str] | None = None) -> int:
     eval_risk = float(args.eval_risk_dollars)
     max_contracts = int(args.max_contracts)
 
-    _print_stage_header("Stage 2 — Backtest (in-sample)")
-    sanity = run_in_sample_sanity(
-        frame,
-        strategy_key,
-        args.timeframe,
-        pipeline_windows,
-        risk_dollars=eval_risk,
-        max_contracts=max_contracts,
-    )
-    top_ok = sanity.topstep.get("topstep_passed")
-    tp_label = "passed" if top_ok else "failed"
-    trades_n = int(sanity.metrics["total_trades"])
-    win_rate = float(sanity.metrics.get("win_rate", 0.0))
-    profit_factor = float(sanity.metrics.get("profit_factor", 0.0))
-    net_pnl = sanity.metrics["total_net_pnl"]
-    avg_r = sanity.metrics["avg_r"]
-    print(
-        f"trade_count={trades_n} win_rate={win_rate:.3f} "
-        f"profit_factor={profit_factor:.3f} net_pnl={net_pnl:.2f} "
-        f"avg_r={avg_r:.4f} topstep_{tp_label}"
-    )
-    print("Gate checks: trades >= 20, win_rate >= 30%, profit_factor >= 1.0")
-    if trades_n < 20:
-        if not args.force:
-            print("REJECT: insufficient sample size")
-            return 1
-        print("WARN: insufficient sample size (--force)")
-    if win_rate < 0.30:
-        if not args.force:
-            print("REJECT: win rate < 30%")
-            return 1
-        print("WARN: win rate < 30% (--force)")
-    if profit_factor < 1.0:
-        if not args.force:
-            print("REJECT: profit factor < 1.0")
-            return 1
-        print("WARN: profit factor < 1.0 (--force)")
+    # Derive WF development window for sensitivity and logging.
+    wf_dev_window = walk_forward_development_window(pipeline_windows)
 
-    _print_stage_header("Stage 3 — Walk-forward")
+    _print_stage_header("Stage 2 — Walk-forward")
     wf_aggregate: dict[str, Any]
     wf_folds_serial: list[dict[str, Any]]
     selected_params: dict[str, Any]
@@ -319,6 +400,8 @@ def main(argv: list[str] | None = None) -> int:
     wf_robust_ok: bool
     wf_all_folds_seq_ok: bool
     fold_rates: list[float] = []
+    speed_optimization_paths: list[str] = []
+    longevity_optimization_path: str | None = None
 
     if args.skip_wf:
         selected_params = dict(spec.default_params)
@@ -357,7 +440,7 @@ def main(argv: list[str] | None = None) -> int:
             f"Walk-forward folds: {len(wf_oos_final)}  wf_robust_ok={wf_robust_ok}  "
             f"wf_all_folds_seq_ok={wf_all_folds_seq_ok}  wf_ok={wf_ok_pre}"
         )
-        for fold in wf_oos_final:
+        for fold_idx, fold in enumerate(wf_oos_final, 1):
             tn = fold.metrics["total_trades"]
             pn = fold.metrics["total_net_pnl"]
             tsp = fold.topstep.get("topstep_passed")
@@ -369,10 +452,23 @@ def main(argv: list[str] | None = None) -> int:
                 f"  {fold.window}: OOS trades={tn} net_pnl={pn:.2f} topstep_pass={tsp} "
                 f"seq_eval_passes={seq} seq_attempts={att} seq_rate={rate_s} score={fold.score:.4f}"
             )
+            if args.optimize_sizing_for_speed:
+                speed_result = optimize_for_speed_wf(
+                    fold.trades,
+                    strategy=strategy_key,
+                    window=fold.window,
+                    pass_floor_pct=args.pass_floor_pct,
+                    pass_target_pct=args.pass_target_pct,
+                )
+                speed_path = output_dir / f"{strategy_key}_wf{fold_idx}_speed_optimization.json"
+                _write_optimization_json(speed_path, speed_result)
+                speed_optimization_paths.append(str(speed_path.resolve()))
+                _print_speed_optimization(speed_result)
         wf_aggregate = aggregate_wf_metrics(wf_oos_final)
         wf_folds_serial = [_eval_json(f) for f in wf_oos_final]
         print("WF aggregate:", ", ".join(f"{k}={v}" for k, v in wf_aggregate.items()))
         print("best_params(selected):", json.dumps(selected_params, sort_keys=True, default=str))
+        print(f"WF development window: {wf_dev_window.start} → {wf_dev_window.end}")
 
     wf_ok = (wf_robust_ok and wf_all_folds_seq_ok) if not args.skip_wf else True
     if not args.skip_wf and not wf_ok:
@@ -403,13 +499,15 @@ def main(argv: list[str] | None = None) -> int:
 
     sensitivity_report: SensitivityReport | None = None
     sensitivity_serial: dict[str, Any] | None = None
+    sensitivity_mc: MCResult | None = None
+    sensitivity_heatmap_path: str | None = None
 
     if args.skip_sensitivity or not spec.param_grid:
         skip_reason = "--skip-sensitivity flag" if args.skip_sensitivity else "no param_grid defined"
-        _print_stage_header("Stage 4 — Parameter sensitivity (skipped)")
+        _print_stage_header("Stage 3 — Parameter sensitivity (skipped)")
         print(f"Skipped: {skip_reason}")
     else:
-        _print_stage_header("Stage 4 — Parameter sensitivity")
+        _print_stage_header("Stage 3 — Parameter sensitivity")
 
         def _trades_fn(params: dict) -> list[TradeResult]:
             result = evaluate_strategy(
@@ -417,7 +515,7 @@ def main(argv: list[str] | None = None) -> int:
                 strategy_key,
                 args.timeframe,
                 params,
-                pipeline_windows.in_sample_sanity,
+                wf_dev_window,
                 risk_dollars=eval_risk,
                 max_contracts=max_contracts,
             )
@@ -441,7 +539,36 @@ def main(argv: list[str] | None = None) -> int:
         if sensitivity_report.is_cliff:
             print(f"  cliff params: {', '.join(sensitivity_report.cliff_params)}")
 
-    _print_stage_header("Stage 5 — Holdout")
+        # MC1: block bootstrap on sensitivity (WF dev window) trades
+        _sens_trades = _trades_fn(selected_params)
+        if _sens_trades:
+            sensitivity_mc = run_mc(
+                _sens_trades,
+                n_perms=args.sensitivity_mc_iterations,
+                block_size=args.mc_block_size,
+                seed=args.sensitivity_mc_seed,
+                ci_pct=args.mc_ci_pct,
+            )
+            _sens_mc_path = graphs_dir / f"{strategy_key}_{args.timeframe}_sensitivity_mc_paths.png"
+            try:
+                plot_mc_paths(sensitivity_mc, _sens_mc_path, title=f"Sensitivity MC — {strategy_key} ({wf_dev_window.start}→{wf_dev_window.end})")
+                sensitivity_heatmap_path = str(_sens_mc_path.resolve())
+                print(f"sensitivity_mc_paths={sensitivity_heatmap_path}")
+            except Exception as exc:
+                print(f"WARN: sensitivity MC graph not written ({exc})", file=sys.stderr)
+            print(mc_summary_text(sensitivity_mc, title="Sensitivity MC1"))
+
+        # Sensitivity heatmap
+        _heatmap_path = graphs_dir / f"{strategy_key}_{args.timeframe}_sensitivity_heatmap.png"
+        try:
+            plot_sensitivity_heatmap(sensitivity_report, _heatmap_path)
+            sensitivity_serial["sensitivity_heatmap_path"] = str(_heatmap_path.resolve())
+            sensitivity_serial["sensitivity_heatmap_text"] = sensitivity_heatmap_text(sensitivity_report)
+            print(f"sensitivity_heatmap={_heatmap_path.resolve()}")
+        except Exception as exc:
+            print(f"WARN: sensitivity heatmap not written ({exc})", file=sys.stderr)
+
+    _print_stage_header("Stage 4 — Holdout")
     holdout_eval = evaluate_strategy(
         frame,
         strategy_key,
@@ -455,6 +582,17 @@ def main(argv: list[str] | None = None) -> int:
         f"holdout net_pnl={float(holdout_eval.metrics['total_net_pnl']):.2f} "
         f"max_dd={float(holdout_eval.metrics['max_drawdown']):.2f}",
     )
+    if args.optimize_sizing_for_longevity:
+        longevity_result = optimize_for_longevity_holdout(
+            holdout_eval.trades,
+            strategy=strategy_key,
+            window="holdout",
+            min_profit_per_trade=args.min_profit_per_trade,
+        )
+        longevity_path = output_dir / f"{strategy_key}_holdout_longevity_optimization.json"
+        _write_optimization_json(longevity_path, longevity_result)
+        longevity_optimization_path = str(longevity_path.resolve())
+        _print_longevity_optimization(longevity_result)
     ho_express_sim = simulate_express_funded_resets(
         holdout_eval.trades,
         rules=DEFAULT_FUNDED_EXPRESS_SIM,
@@ -477,17 +615,34 @@ def main(argv: list[str] | None = None) -> int:
         f"peak_nominal=${ho_express_sim.max_nominal_peak_balance:.2f}",
     )
 
-    _print_stage_header("Stage 6 — Monte Carlo (trade-order)")
+    _print_stage_header("Stage 5 — Monte Carlo (trade-order, holdout)")
     holdout_mc = run_holdout_trade_monte_carlo(
         holdout_eval.trades,
         n=args.holdout_mc_iterations,
         seed=args.holdout_mc_seed,
+        block_size=args.mc_block_size,
+        ci_pct=args.mc_ci_pct,
     )
     ho_mc_d = holdout_monte_carlo_summary_dict(holdout_mc)
-    print(
-        f"holdout_mc pnl p05/p50/p95="
-        f"{holdout_mc.pnl_p05:.2f}/{holdout_mc.pnl_p50:.2f}/{holdout_mc.pnl_p95:.2f}",
+    print(mc_summary_text(holdout_mc, title="Holdout MC2"))
+
+    holdout_mc_graph_path: str | None = None
+    _ho_mc_path = graphs_dir / f"{strategy_key}_{args.timeframe}_holdout_mc_paths.png"
+    try:
+        plot_holdout_mc_paths(holdout_mc, _ho_mc_path)
+        holdout_mc_graph_path = str(_ho_mc_path.resolve())
+        print(f"holdout_mc_paths={holdout_mc_graph_path}")
+    except Exception as exc:
+        print(f"WARN: holdout MC graph not written ({exc})", file=sys.stderr)
+
+    _print_stage_header("Stage 6 — Regime classifier")
+    regime_result = classify_regime_fit(
+        frame,
+        holdout_eval.trades,
+        pipeline_windows.holdout,
     )
+    regime_d = regime_summary_dict(regime_result)
+    print(regime_summary_text(regime_result))
 
     cliff_flag = sensitivity_report.is_cliff if sensitivity_report is not None else None
     _print_stage_header("Stage 7 — Verdict")
@@ -522,6 +677,15 @@ def main(argv: list[str] | None = None) -> int:
         print(f"audit_stamp={audit_path.resolve()}")
         print(f"audit_log.jsonl={log_path.resolve()}")
 
+    sensitivity_mc_serial: dict[str, Any] | None = (
+        mc_summary_dict(sensitivity_mc) if sensitivity_mc is not None else None
+    )
+    if sensitivity_mc_serial is not None and sensitivity_heatmap_path is not None:
+        sensitivity_mc_serial["graph_path"] = sensitivity_heatmap_path
+
+    if holdout_mc_graph_path is not None:
+        ho_mc_d["graph_path"] = holdout_mc_graph_path
+
     result_bundle: dict[str, Any] = {
         "strategy": strategy_key,
         "timeframe": args.timeframe,
@@ -532,10 +696,15 @@ def main(argv: list[str] | None = None) -> int:
         "pipeline_config": str(args.pipeline_config) if args.pipeline_config else None,
         "skip_walk_forward": bool(args.skip_wf),
         "skip_sensitivity": bool(args.skip_sensitivity),
-        "sizing": {"eval_risk_dollars": eval_risk, "max_contracts": max_contracts},
+        "sizing": {
+            "eval_risk_dollars": eval_risk,
+            "max_contracts": max_contracts,
+            "speed_optimization_paths": speed_optimization_paths,
+            "longevity_optimization_path": longevity_optimization_path,
+        },
         "min_fold_seq_pass_rate_pct": float(args.min_fold_seq_pass_rate_pct),
+        "wf_development_window": {"name": wf_dev_window.name, "start": wf_dev_window.start, "end": wf_dev_window.end},
         "stage_validate": {"status": "ok"},
-        "in_sample_sanity": _eval_json(sanity),
         "walk_forward": {
             "aggregate": wf_aggregate,
             "best_params": selected_params,
@@ -544,9 +713,11 @@ def main(argv: list[str] | None = None) -> int:
             "wf_all_folds_seq_ok": wf_all_folds_seq_ok,
         },
         "sensitivity": sensitivity_serial,
+        "sensitivity_mc": sensitivity_mc_serial,
         "holdout": _eval_json(holdout_eval),
         "express_funded_reset_sim": express_sim_summary,
         "holdout_monte_carlo": ho_mc_d,
+        "regime_fit": regime_d,
         "verdict": verdict_summary_dict(verdict),
         "verdict_thresholds": asdict(verdict_thresholds),
         "freeze": (
@@ -582,17 +753,26 @@ def main(argv: list[str] | None = None) -> int:
         ("strategy", strategy_key),
         ("timeframe", args.timeframe),
         ("verdict", verdict.verdict),
+        ("regime_fit", regime_result.verdict),
         ("wf_robust_ok", str(wf_robust_ok)),
         ("wf_all_folds_seq_ok", str(wf_all_folds_seq_ok)),
         ("holdout_net_pnl", f"{float(holdout_eval.metrics['total_net_pnl']):.2f}"),
         ("holdout_mc_pnl_p05", f"{holdout_mc.pnl_p05:.2f}"),
         ("sensitivity_flag", sensitivity_flag_label),
         ("wf_oos_total_pnl", f"{wf_aggregate.get('wf_oos_total_pnl', 0.0):.2f}"),
-        ("in_sample_net_pnl", f"{sanity.metrics['total_net_pnl']:.2f}"),
+        ("wf_dev_window", f"{wf_dev_window.start} → {wf_dev_window.end}"),
         ("result_json", str(out_json.resolve())),
     ]
     if summary_path is not None:
         table_rows.append(("readable_summary_txt", str(summary_path.resolve())))
+    if holdout_mc_graph_path is not None:
+        table_rows.append(("holdout_mc_graph", holdout_mc_graph_path))
+    if sensitivity_heatmap_path is not None:
+        table_rows.append(("sensitivity_mc_graph", sensitivity_heatmap_path))
+    for idx, path in enumerate(speed_optimization_paths, 1):
+        table_rows.append((f"wf{idx}_speed_optimization", path))
+    if longevity_optimization_path is not None:
+        table_rows.append(("holdout_longevity_optimization", longevity_optimization_path))
     if params_hash is not None and audit_path is not None:
         table_rows.extend(
             [

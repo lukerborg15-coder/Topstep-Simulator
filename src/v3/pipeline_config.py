@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -20,10 +19,9 @@ def _parse_date_window(name: str, obj: dict[str, Any]) -> DateWindow:
 
 
 def load_pipeline_windows(path: str | Path) -> PipelineWindows:
-    """Load `PipelineWindows` from JSON. Schema mirrors `WINDOWS` in config."""
+    """Load `PipelineWindows` from JSON. `in_sample_sanity` key is optional and ignored."""
     raw = Path(path).read_text(encoding="utf-8")
     data = json.loads(raw)
-    in_sample = _parse_date_window("in_sample_sanity", data["in_sample_sanity"])
     holdout = _parse_date_window("holdout", data["holdout"])
     wf_items: list[WalkForwardWindow] = []
     for wf in data["walk_forward"]:
@@ -35,16 +33,14 @@ def load_pipeline_windows(path: str | Path) -> PipelineWindows:
             )
         )
     return PipelineWindows(
-        in_sample_sanity=in_sample,
         walk_forward=tuple(wf_items),
         holdout=holdout,
     )
 
 
 def windows_to_jsonable(windows: PipelineWindows) -> dict[str, Any]:
-    """Serialize defaults for `windows.example.json`."""
+    """Serialize for `windows.example.json`."""
     return {
-        "in_sample_sanity": {"name": windows.in_sample_sanity.name, "start": windows.in_sample_sanity.start, "end": windows.in_sample_sanity.end},
         "holdout": {"name": windows.holdout.name, "start": windows.holdout.start, "end": windows.holdout.end},
         "walk_forward": [
             {

@@ -82,7 +82,6 @@ def test_main_applies_custom_scoring_weights_before_walk_forward(
     monkeypatch.setitem(STRATEGIES, "unit_scoring", spec)
     monkeypatch.setattr(cli, "load_user_strategies", lambda: None)
     monkeypatch.setattr(cli, "load_ohlcv", lambda **kwargs: pd.DataFrame())
-    monkeypatch.setattr(cli, "run_in_sample_sanity", lambda *args, **kwargs: _result(topstep_score=100.0, avg_r=0.8))
 
     def fake_run_walk_forward(*args: Any, **kwargs: Any) -> Any:
         captured["weights"] = evaluator.SCORING_WEIGHTS

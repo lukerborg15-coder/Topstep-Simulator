@@ -243,28 +243,6 @@ def attach_sequential_topstep_oos(result: EvaluationResult) -> None:
     result.topstep = td
 
 
-def run_in_sample_sanity(
-    frame: pd.DataFrame,
-    strategy_name: str,
-    timeframe: str,
-    windows: PipelineWindows | None = None,
-    *,
-    risk_dollars: float = DEFAULT_RISK_DOLLARS,
-    max_contracts: int | None = None,
-) -> EvaluationResult:
-    spec = STRATEGIES[strategy_name]
-    w = windows or WINDOWS
-    return evaluate_strategy(
-        frame,
-        strategy_name,
-        timeframe,
-        dict(spec.default_params),
-        w.in_sample_sanity,
-        risk_dollars=risk_dollars,
-        max_contracts=max_contracts,
-    )
-
-
 def run_walk_forward(
     frame: pd.DataFrame,
     strategy_name: str,
@@ -290,8 +268,18 @@ def run_walk_forward(
 
     w = windows or WINDOWS
     wf_list = w.walk_forward
+    n_folds = len(wf_list)
     if min_folds_meeting_passes is None:
-        min_folds_meeting_passes = len(wf_list)
+        min_folds_meeting_passes = n_folds
+    # Clamp to available folds to prevent deadlock on small configs.
+    if min_folds_meeting_passes > n_folds:
+        import sys
+        print(
+            f"WARNING: --min-wf-passes {min_folds_meeting_passes} > folds available {n_folds}; "
+            f"clamping to {n_folds}.",
+            file=sys.stderr,
+        )
+        min_folds_meeting_passes = n_folds
     if min_folds_meeting_passes < 1:
         raise ValueError("min_folds_meeting_passes must be at least 1")
 
@@ -363,6 +351,20 @@ def wf_oos_folds_for_selected_params(
         attach_sequential_topstep_oos(oos)
         out.append(oos)
     return out
+
+
+def walk_forward_development_window(windows: PipelineWindows) -> DateWindow:
+    """Derive development window: min(all train.start) → max(all test.end).
+
+    Covers the full WF calendar (train + OOS) in one contiguous DateWindow.
+    Used by sensitivity stage as the evaluation slice.
+    """
+    wf_list = windows.walk_forward
+    if not wf_list:
+        raise ValueError("PipelineWindows has no walk_forward folds")
+    start = min(wf.train.start for wf in wf_list)
+    end = max(wf.test.end for wf in wf_list)
+    return DateWindow("wf_development", start, end)
 
 
 def aggregate_wf_metrics(folds: list[EvaluationResult]) -> dict[str, Any]:
@@ -492,8 +494,8 @@ __all__ = [
     "compute_metrics",
     "evaluate_strategy",
     "fold_seq_eval_pass_rate",
-    "run_in_sample_sanity",
     "run_walk_forward",
     "simulate_trades",
+    "walk_forward_development_window",
     "wf_oos_folds_for_selected_params",
 ]
