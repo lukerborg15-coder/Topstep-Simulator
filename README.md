@@ -144,8 +144,10 @@ topstep-pipeline --strategy hl2_sma_retrace_atr --mode holdout-only
 | `--pipeline-config` | built-in | JSON file overriding WF and holdout date windows |
 | `--skip-wf` | off | Skip walk-forward; use `default_params` directly |
 | `--force` | off | Continue past WF gate failures (verdict may still REJECT) |
-| `--optimize-sizing-for-speed` | off | Find risk sizing for fastest Combine pass |
-| `--optimize-sizing-for-longevity` | off | Find risk sizing for max funded account longevity |
+| `--optimize-sizing-for-speed` | off | Find risk sizing for fastest Combine pass (see Sizing Optimizers section) |
+| `--optimize-sizing-for-longevity` | off | Find risk sizing for max funded account longevity (see Sizing Optimizers section) |
+| `--compare-fixed-risk` | unset | Compare optimizer vs a fixed $/trade |
+| `--compare-fixed-contracts` | unset | Compare optimizer vs a fixed contract count |
 | `--output-dir` | `output/` | Root for JSON, summaries, frozen params |
 | `--data-dir` | `Data/` | Directory containing MNQ CSV bundles |
 | `--topstep-weight` | `1.0` | Walk-forward scoring weight for topstep_score |
@@ -159,58 +161,93 @@ topstep-pipeline --strategy hl2_sma_retrace_atr --mode holdout-only
 
 ## Contract / Sizing Optimizers
 
-Two optional post-evaluation stages in `position_sizing.py`. Both grid-search over risk levels ($50, $75, $100, $150, $200, $300, $400, $500 by default), resize all trades at each level, and rank candidates on a Pareto objective. Results saved to JSON in `output/`.
+Two post-evaluation stages in `position_sizing.py`. Both grid-search over risk levels (default `[$50, $75, $100, $150, $200, $300, $400, $500]`), resize all trades at each level, and rank candidates on a robust objective. Results saved to JSON in `output/`.
 
 ### Speed Optimizer (`--optimize-sizing-for-speed`)
 
-**Goal:** find the risk-per-trade that gets you through the Topstep Combine fastest while staying above a minimum pass rate.
+**Goal:** find the risk-per-trade that gets you through the Topstep Combine fastest with a high pass rate. Soft target is **≤ 10 days to pass**.
 
-Runs on each WF OOS fold after walk-forward. For each risk level it:
-1. Rescales trade P&L by the new contract count (via `_contracts_for_fixed_risk`)
-2. Runs `count_sequential_eval_passes` — the same sequential Combine eval used by walk-forward gates
-3. Collects `days_to_pass` from every passing eval attempt
-4. Filters out any risk level with `pass_rate < --pass-floor-pct` (default 40%)
-5. Ranks survivors by `mean_days_to_pass` ascending, then `pass_rate` descending
-6. Returns top 5 candidates + the optimal pick
+**Method (V2 — train-fit, OOS-evaluate, aggregate):**
+1. For each WF fold, optimize on the **training** trades only (no OOS peeking).
+2. Cap each evaluation chain at `--speed-attempt-budget` (default 10) — pass rate is `passes / min(N, attempts)`, comparable across risk levels.
+3. Filter risks via coverage threshold: each risk must produce ≥ 1 contract on ≥ `--risk-coverage-threshold` (default 50%) of trades.
+4. Compute median, mean, IQR, p90, std (ddof=1) of `days_to_pass`.
+5. Rank candidates by **utility = pass_rate × exp(-max(0, median_days − target) / 5)** with target = `--speed-target-days` (default 10). Soft penalty past 10 days.
+6. Evaluate the train-winner on the OOS fold to record honest test performance.
+7. Aggregate across folds: keep risks viable in ≥ ⌈N/2⌉ folds; rank by **median OOS utility**, tiebreak by **worst-fold utility**.
 
-Output per WF fold: `output/<strategy>_wf<N>_speed_optimization.json`
+**Output:** `output/<strategy>_wf_speed_optimization_aggregate.json` (the deliverable). Per-fold diagnostics still written as `output/<strategy>_wf<N>_speed_optimization_diagnostic.json`.
 
-Key flags:
 | Flag | Default | Description |
 |---|---|---|
-| `--optimize-sizing-for-speed` | off | Enable speed optimizer on WF folds |
-| `--pass-floor-pct` | `40.0` | Min pass rate % to be a valid candidate |
-| `--pass-target-pct` | `75.0` | Target pass rate % (informational, logged only) |
+| `--optimize-sizing-for-speed` | off | Enable speed optimizer |
+| `--speed-attempt-budget` | `10` | Max sequential eval attempts per fold/risk |
+| `--speed-target-days` | `10.0` | Soft ceiling for days-to-pass; utility decays past this |
+| `--pass-floor-pct` | `40.0` | Min train pass rate % to qualify as viable |
+| `--risk-coverage-threshold` | `0.5` | Min fraction of trades that must produce ≥ 1 contract |
 
 ### Longevity Optimizer (`--optimize-sizing-for-longevity`)
 
-**Goal:** find the risk-per-trade that keeps a funded account alive the longest across the full holdout period.
+**Goal:** find the risk-per-trade that keeps a funded account alive longest with low drawdown across holdout — typically smaller size, higher win rate, less DD.
 
-Runs once on holdout trades. For each risk level it:
-1. Rescales trade P&L by the new contract count
-2. Runs `simulate_express_funded_resets` — the same multi-stint funded account sim used in Stage 4
-3. Computes `avg_pnl_per_trade` across all stints
-4. Filters out any risk level below `--min-profit-per-trade` (default $150)
-5. Ranks survivors by `longevity_score` descending — defined as `funded_accounts_used + (accrued_pnl_bank / 50000)` — then by `avg_pnl_per_trade` descending
-6. Returns top 5 candidates + the optimal pick
+**Method (V2 — block-bootstrap MC + multi-component score):**
+1. For each risk level, resize trades and check a **profit-factor floor** (`--longevity-min-profit-factor`, default 1.2).
+2. Run **bootstrap CI on avg PnL/trade** (`--longevity-bootstrap-iterations`, default 1000). The percentile floor (`--longevity-confidence-level`, default p05) must clear `--min-profit-per-trade`. This rejects risks that only look profitable due to small-sample luck.
+3. Run **block-bootstrap Monte Carlo** over the resized holdout trades (`--longevity-mc-iterations` runs, `--longevity-mc-block-size` block size — defaults 500 / 5). Each MC iteration runs `simulate_express_funded_resets` and computes:
+   - `survival_score = (accounts_used − accounts_blown) / accounts_used` ∈ [0, 1]
+   - `drawdown_score = 1 − (worst_peak_to_trough / max_drawdown_limit)` ∈ [0, 1]
+   - `efficiency_score = avg_pnl_per_trade / target_pnl_per_trade`
+   - `capital_score = total_pnl / account_size`
+4. Composite **`longevity_score = w_survival·survival + w_drawdown·drawdown + w_efficiency·efficiency + w_capital·capital`** (defaults 0.4 / 0.2 / 0.2 / 0.2 — all overridable).
+5. **Hard survival filter:** `p05(survival_score) ≥ 0.5` — catastrophic-failure risks rejected regardless of score.
+6. Rank survivors by `median(longevity_score)`, tiebreak by `p05(longevity_score)`.
+7. Per-account survival days from the deterministic baseline sim are surfaced for the chosen risk.
 
-Output: `output/<strategy>_holdout_longevity_optimization.json`
+**Output:** `output/<strategy>_holdout_longevity_optimization_mc.json`
 
-Key flags:
 | Flag | Default | Description |
 |---|---|---|
-| `--optimize-sizing-for-longevity` | off | Enable longevity optimizer on holdout |
-| `--min-profit-per-trade` | `150.0` | Min avg P&L per trade for a candidate to qualify |
+| `--optimize-sizing-for-longevity` | off | Enable longevity optimizer |
+| `--longevity-mc-iterations` | `500` | Block-bootstrap MC permutations over holdout |
+| `--longevity-mc-block-size` | `5` | Trade block size for the bootstrap |
+| `--longevity-bootstrap-iterations` | `1000` | Resamples for the avg-PnL CI floor |
+| `--longevity-confidence-level` | `0.05` | Percentile (e.g. 0.05 = p05) for confidence floors |
+| `--longevity-weight-survival` | `0.4` | Weight on survival component |
+| `--longevity-weight-drawdown` | `0.2` | Weight on drawdown component |
+| `--longevity-weight-efficiency` | `0.2` | Weight on per-trade efficiency component |
+| `--longevity-weight-capital` | `0.2` | Weight on total-PnL component |
+| `--longevity-min-profit-factor` | `1.2` | Reject risks with profit factor below this |
+| `--min-profit-per-trade` | `150.0` | Floor on p05 of bootstrap mean PnL per trade |
 
-### Example — run both optimizers together
+### Sizing Comparison (Optimizer vs. Fixed)
+
+Test the optimizer against a fixed sizing of your choice. Pipeline runs up to 3 tracks through eval **and** holdout, then reports deltas with sanity flags.
+
+| Flag | Default | Description |
+|---|---|---|
+| `--compare-fixed-risk` | unset | Fixed $/trade for comparison track (e.g. `100`) |
+| `--compare-fixed-contracts` | unset | Fixed contract count for comparison track (e.g. `2`) |
+
+When either is set, the comparison runs and writes `output/<strategy>_sizing_comparison.json`. Both can be set simultaneously for a 3-track race (Optimizer / Fixed-$ / Fixed-contracts).
+
+**Sanity flags** are raised when:
+- A fixed track beats the optimizer's eval pass rate by > 5pp
+- A fixed track beats the optimizer's holdout longevity score by > 0.10
+- The optimizer chose a risk viable in fewer than all WF folds
+- Holdout sample size < 50 trades
+
+The comparison **just reports** — it does not auto-recommend. Read the sanity flags before freezing.
+
+### Example — run optimizers + comparison
 
 ```bash
 topstep-pipeline --strategy hl2_sma_retrace_atr --mode full \
-  --optimize-sizing-for-speed --pass-floor-pct 50 \
-  --optimize-sizing-for-longevity --min-profit-per-trade 200
+  --optimize-sizing-for-speed --speed-target-days 10 \
+  --optimize-sizing-for-longevity --min-profit-per-trade 150 \
+  --compare-fixed-risk 100 --compare-fixed-contracts 2
 ```
 
----
+The text summary (`output/txt summaries/<strategy>_<tf>_result_summary.txt`) puts the chosen `EVAL SIZING` and `FUNDED SIZING` values in a bordered "FROZEN PARAMETERS" block at the top, with `>>>` markers and explicit annotations of which metric each risk parameter optimizes.
 
 ## Default Date Windows
 

@@ -17,8 +17,9 @@ def test_json_object_to_readable_text():
 
 def test_pipeline_result_bundle_is_string():
     d = pipeline_result_bundle_to_readable_text({"stage_validate": {"status": "ok"}})
-    assert "STAGE 1 — validate" in d
-    assert "RUN INPUTS" in d
+    # New layout uses TOPSTEP PIPELINE header and ASCII section dividers
+    assert "TOPSTEP PIPELINE" in d
+    assert "End of summary" in d
 
 
 def test_write_readable_text_from_json_file(tmp_path: Path):

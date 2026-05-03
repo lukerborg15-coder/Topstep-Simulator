@@ -35,6 +35,7 @@ from .evaluator import (
     run_walk_forward,
     walk_forward_development_window,
     wf_oos_folds_for_selected_params,
+    wf_train_test_trades_for_selected_params,
 )
 from .freeze import freeze_params
 from .funded_express_sim import express_funded_reset_sim_summary_dict, simulate_express_funded_resets
@@ -47,11 +48,16 @@ from .json_readable import write_readable_text_from_json_file
 from .monte_carlo import MCResult, mc_summary_dict, mc_summary_text, plot_mc_paths, run_mc
 from .pipeline_config import resolve_windows
 from .position_sizing import (
+    LongevityOptimizationMCResult,
     LongevityOptimizationResult,
+    SpeedOptimizationAggregateResult,
     SpeedOptimizationResult,
     optimize_for_longevity_holdout,
     optimize_for_speed_wf,
+    optimize_longevity_holdout_mc,
+    optimize_speed_wf_aggregate,
 )
+from .sizing_comparison import SizingComparisonResult, run_sizing_comparison
 from .regime_classifier import classify_regime_fit, regime_summary_dict, regime_summary_text
 from .sensitivity import (
     SensitivityReport,
@@ -160,6 +166,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--pass-target-pct", type=float, default=75.0, help="Target pass rate percentage for walk-forward speed sizing reporting (default 75).")
     parser.add_argument("--optimize-sizing-for-longevity", action="store_true", help="Run holdout sizing optimization for funded-account longevity.")
     parser.add_argument("--min-profit-per-trade", type=float, default=150.0, help="Minimum average P&L per trade for holdout longevity sizing candidates (default 150).")
+    parser.add_argument("--speed-attempt-budget", type=int, default=10, help="Max sequential eval attempts per fold/risk for speed optimization (default 10).")
+    parser.add_argument("--speed-target-days", type=float, default=10.0, help="Target days to pass for speed optimization utility decay (default 10).")
+    parser.add_argument("--longevity-mc-iterations", type=int, default=500, help="Monte Carlo iterations for longevity optimization (default 500).")
+    parser.add_argument("--longevity-mc-block-size", type=int, default=5, help="Block size for block-bootstrap in longevity MC (default 5).")
+    parser.add_argument("--longevity-bootstrap-iterations", type=int, default=1000, help="Bootstrap iterations for P05 pnl estimation (default 1000).")
+    parser.add_argument("--longevity-confidence-level", type=float, default=0.05, help="Percentile for hard filters in longevity MC (default 0.05 = 5th percentile).")
+    parser.add_argument("--longevity-weight-survival", type=float, default=0.4, help="Weight for survival score in longevity optimization (default 0.4).")
+    parser.add_argument("--longevity-weight-drawdown", type=float, default=0.2, help="Weight for drawdown score in longevity optimization (default 0.2).")
+    parser.add_argument("--longevity-weight-efficiency", type=float, default=0.2, help="Weight for efficiency score in longevity optimization (default 0.2).")
+    parser.add_argument("--longevity-weight-capital", type=float, default=0.2, help="Weight for capital score in longevity optimization (default 0.2).")
+    parser.add_argument("--longevity-min-profit-factor", type=float, default=1.2, help="Min profit factor for longevity candidates (default 1.2).")
+    parser.add_argument("--risk-coverage-threshold", type=float, default=0.5, help="Min fraction of trades needing >=1 contract for risk levels (default 0.5).")
+    parser.add_argument("--compare-fixed-risk", type=float, default=None, help="Fixed risk dollars for sizing comparison (optional).")
+    parser.add_argument("--compare-fixed-contracts", type=int, default=None, help="Fixed contracts for sizing comparison (optional).")
     return parser
 
 
@@ -277,6 +297,29 @@ def _print_speed_optimization(result: SpeedOptimizationResult) -> None:
         )
 
 
+def _print_speed_optimization_aggregate(result: SpeedOptimizationAggregateResult) -> None:
+    print()
+    print(f"=== Walk-Forward Speed Optimization (Aggregate) ===")
+    print(f"Optimal Risk: {_money(result.optimal_risk_dollars)}/trade")
+    print(f"Median OOS Utility: {result.median_oos_utility:.4f}")
+    print(f"Min OOS Utility: {result.min_oos_utility:.4f}")
+    print(f"Median OOS Pass Rate: {result.median_oos_pass_rate_pct:.1f}%")
+    print(f"Median OOS Median Days: {result.median_oos_median_days_to_pass:.1f} days")
+    print(f"Viable in {len(set(p['fold_idx'] for p in result.per_fold_oos)) if result.per_fold_oos else 0}/{result.n_folds} folds")
+    print()
+    print("Top 5 alternatives:")
+    if not result.candidates:
+        print("(no candidates)")
+        return
+    for idx, candidate in enumerate(result.candidates[:5], 1):
+        print(
+            f"{idx}. {_money(float(candidate['risk_dollars']))}  "
+            f"utility={float(candidate['median_oos_utility']):.4f}  "
+            f"{float(candidate['median_oos_pass_rate_pct']):.1f}%  "
+            f"{float(candidate['median_oos_median_days_to_pass']):.1f}d"
+        )
+
+
 def _print_longevity_optimization(result: LongevityOptimizationResult) -> None:
     print()
     print("=== Holdout Longevity Optimization ===")
@@ -300,6 +343,32 @@ def _print_longevity_optimization(result: LongevityOptimizationResult) -> None:
             f"{idx}. {_money(float(candidate['risk_dollars']))}   "
             f"{_money(float(candidate['avg_pnl_per_trade']))}/trade   "
             f"{accounts} {account_word}   score={float(candidate['longevity_score']):.2f}"
+        )
+
+
+def _print_longevity_optimization_mc(result: LongevityOptimizationMCResult) -> None:
+    print()
+    print("=== Holdout Longevity Optimization (Monte Carlo) ===")
+    print(f"Optimal Risk: {_money(result.optimal_risk_dollars)}/trade")
+    print(f"Median Longevity Score: {result.median_longevity_score:.4f}  (p05: {result.p05_longevity_score:.4f})")
+    print(f"Median Avg P&L/Trade: {_money(result.median_avg_pnl_per_trade)}  (p05: {_money(result.p05_avg_pnl_per_trade)})")
+    print(f"Median Accounts Used: {result.median_accounts_used:.1f}  Blown: {result.median_accounts_blown:.1f}")
+    print()
+    print("Component scores (median / p05):")
+    for comp in ["survival_score", "drawdown_score", "efficiency_score", "capital_score"]:
+        med = result.median_components.get(comp, 0.0)
+        p05 = result.p05_components.get(comp, 0.0)
+        print(f"  {comp:.<30} {med:.4f} / {p05:.4f}")
+    print()
+    print("Top 5 alternatives:")
+    if not result.candidates:
+        print("(no candidates)")
+        return
+    for idx, candidate in enumerate(result.candidates[:5], 1):
+        print(
+            f"{idx}. {_money(float(candidate['risk_dollars']))}  "
+            f"med_long={float(candidate['median_longevity_score']):.4f}  "
+            f"p05_long={float(candidate['p05_longevity_score']):.4f}"
         )
 
 
@@ -402,6 +471,10 @@ def main(argv: list[str] | None = None) -> int:
     fold_rates: list[float] = []
     speed_optimization_paths: list[str] = []
     longevity_optimization_path: str | None = None
+    speed_optimization_aggregate_result: SpeedOptimizationAggregateResult | None = None
+    longevity_optimization_mc_result: LongevityOptimizationMCResult | None = None
+    sizing_comparison_result: SizingComparisonResult | None = None
+    fold_trade_pairs: list[tuple[list[TradeResult], list[TradeResult]]] = []
 
     if args.skip_wf:
         selected_params = dict(spec.default_params)
@@ -440,6 +513,18 @@ def main(argv: list[str] | None = None) -> int:
             f"Walk-forward folds: {len(wf_oos_final)}  wf_robust_ok={wf_robust_ok}  "
             f"wf_all_folds_seq_ok={wf_all_folds_seq_ok}  wf_ok={wf_ok_pre}"
         )
+        # Extract train-test trade pairs for aggregate optimizers
+        if args.optimize_sizing_for_speed or (args.compare_fixed_risk is not None or args.compare_fixed_contracts is not None):
+            fold_trade_pairs = wf_train_test_trades_for_selected_params(
+                frame,
+                strategy_key,
+                args.timeframe,
+                selected_params,
+                pipeline_windows,
+                risk_dollars=eval_risk,
+                max_contracts=max_contracts,
+            )
+
         for fold_idx, fold in enumerate(wf_oos_final, 1):
             tn = fold.metrics["total_trades"]
             pn = fold.metrics["total_net_pnl"]
@@ -452,18 +537,23 @@ def main(argv: list[str] | None = None) -> int:
                 f"  {fold.window}: OOS trades={tn} net_pnl={pn:.2f} topstep_pass={tsp} "
                 f"seq_eval_passes={seq} seq_attempts={att} seq_rate={rate_s} score={fold.score:.4f}"
             )
-            if args.optimize_sizing_for_speed:
-                speed_result = optimize_for_speed_wf(
-                    fold.trades,
-                    strategy=strategy_key,
-                    window=fold.window,
-                    pass_floor_pct=args.pass_floor_pct,
-                    pass_target_pct=args.pass_target_pct,
-                )
-                speed_path = output_dir / f"{strategy_key}_wf{fold_idx}_speed_optimization.json"
-                _write_optimization_json(speed_path, speed_result)
-                speed_optimization_paths.append(str(speed_path.resolve()))
-                _print_speed_optimization(speed_result)
+
+        # Run aggregate speed optimization if enabled
+        if args.optimize_sizing_for_speed and fold_trade_pairs:
+            speed_optimization_aggregate_result = optimize_speed_wf_aggregate(
+                fold_trade_pairs,
+                strategy=strategy_key,
+                risk_levels=[50.0, 75.0, 100.0, 150.0, 200.0, 300.0, 400.0, 500.0],
+                pass_floor_pct=args.pass_floor_pct,
+                speed_target_days=args.speed_target_days,
+                attempt_budget=args.speed_attempt_budget,
+                coverage_threshold=args.risk_coverage_threshold,
+            )
+            speed_path = output_dir / f"{strategy_key}_wf_speed_optimization_aggregate.json"
+            _write_optimization_json(speed_path, speed_optimization_aggregate_result)
+            speed_optimization_paths.append(str(speed_path.resolve()))
+            _print_speed_optimization_aggregate(speed_optimization_aggregate_result)
+
         wf_aggregate = aggregate_wf_metrics(wf_oos_final)
         wf_folds_serial = [_eval_json(f) for f in wf_oos_final]
         print("WF aggregate:", ", ".join(f"{k}={v}" for k, v in wf_aggregate.items()))
@@ -583,16 +673,60 @@ def main(argv: list[str] | None = None) -> int:
         f"max_dd={float(holdout_eval.metrics['max_drawdown']):.2f}",
     )
     if args.optimize_sizing_for_longevity:
-        longevity_result = optimize_for_longevity_holdout(
+        # Use new MC-based longevity optimizer
+        longevity_optimization_mc_result = optimize_longevity_holdout_mc(
             holdout_eval.trades,
             strategy=strategy_key,
             window="holdout",
             min_profit_per_trade=args.min_profit_per_trade,
+            min_profit_factor=args.longevity_min_profit_factor,
+            weights={
+                "survival_score": args.longevity_weight_survival,
+                "drawdown_score": args.longevity_weight_drawdown,
+                "efficiency_score": args.longevity_weight_efficiency,
+                "capital_score": args.longevity_weight_capital,
+            },
+            mc_iterations=args.longevity_mc_iterations,
+            mc_block_size=args.longevity_mc_block_size,
+            bootstrap_iterations=args.longevity_bootstrap_iterations,
+            confidence_level=args.longevity_confidence_level,
+            coverage_threshold=args.risk_coverage_threshold,
         )
-        longevity_path = output_dir / f"{strategy_key}_holdout_longevity_optimization.json"
-        _write_optimization_json(longevity_path, longevity_result)
+        longevity_path = output_dir / f"{strategy_key}_holdout_longevity_optimization_mc.json"
+        _write_optimization_json(longevity_path, longevity_optimization_mc_result)
         longevity_optimization_path = str(longevity_path.resolve())
-        _print_longevity_optimization(longevity_result)
+        _print_longevity_optimization_mc(longevity_optimization_mc_result)
+
+        # Run sizing comparison if both optimizers are available and comparison flags are set
+        if (
+            speed_optimization_aggregate_result is not None
+            and longevity_optimization_mc_result is not None
+            and (args.compare_fixed_risk is not None or args.compare_fixed_contracts is not None)
+            and fold_trade_pairs
+        ):
+            sizing_comparison_result = run_sizing_comparison(
+                fold_trade_pairs,
+                holdout_eval.trades,
+                speed_optimization_aggregate_result,
+                longevity_optimization_mc_result,
+                fixed_risk_dollars=args.compare_fixed_risk,
+                fixed_contracts=args.compare_fixed_contracts,
+            )
+            comparison_path = output_dir / f"{strategy_key}_sizing_comparison.json"
+            payload = _json_safe(asdict(sizing_comparison_result))
+            comparison_path.write_text(json.dumps(payload, indent=2, sort_keys=False, default=str) + "\n")
+            print()
+            print("=== Sizing Comparison ===")
+            print(f"Optimizer eval pass rate: {sizing_comparison_result.track_a_optimizer['eval_track']['pass_rate_pct']:.1f}%")
+            if sizing_comparison_result.track_b_fixed_risk:
+                print(f"Fixed risk eval pass rate: {sizing_comparison_result.track_b_fixed_risk['eval_track']['pass_rate_pct']:.1f}%")
+            if sizing_comparison_result.track_c_fixed_contracts:
+                print(f"Fixed contracts eval pass rate: {sizing_comparison_result.track_c_fixed_contracts['eval_track']['pass_rate_pct']:.1f}%")
+            if sizing_comparison_result.sanity_flags:
+                print("Sanity flags:")
+                for flag in sizing_comparison_result.sanity_flags:
+                    print(f"  - {flag}")
+
     ho_express_sim = simulate_express_funded_resets(
         holdout_eval.trades,
         rules=DEFAULT_FUNDED_EXPRESS_SIM,
