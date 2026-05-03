@@ -305,7 +305,7 @@ def _print_speed_optimization_aggregate(result: SpeedOptimizationAggregateResult
     print(f"Min OOS Utility: {result.min_oos_utility:.4f}")
     print(f"Median OOS Pass Rate: {result.median_oos_pass_rate_pct:.1f}%")
     print(f"Median OOS Median Days: {result.median_oos_median_days_to_pass:.1f} days")
-    print(f"Viable in {len(set(p['fold_idx'] for p in result.per_fold_oos)) if result.per_fold_oos else 0}/{result.n_folds} folds")
+    print(f"Viable in {result.viable_folds}/{result.n_folds} folds")
     print()
     print("Top 5 alternatives:")
     if not result.candidates:
@@ -904,28 +904,4 @@ def main(argv: list[str] | None = None) -> int:
     if sensitivity_heatmap_path is not None:
         table_rows.append(("sensitivity_mc_graph", sensitivity_heatmap_path))
     for idx, path in enumerate(speed_optimization_paths, 1):
-        table_rows.append((f"wf{idx}_speed_optimization", path))
-    if longevity_optimization_path is not None:
-        table_rows.append(("holdout_longevity_optimization", longevity_optimization_path))
-    if params_hash is not None and audit_path is not None:
-        table_rows.extend(
-            [
-                ("frozen_params_sha256", params_hash[:16] + "..."),
-                ("audit_stamp", str(audit_path.resolve())),
-                ("audit_log_jsonl", str(log_path.resolve())),
-            ]
-        )
-    _print_summary_table(table_rows)
-    return 0
-
-
-def _print_strategies() -> None:
-    for key in sorted(STRATEGIES):
-        spec = STRATEGIES[key]
-        requires = ", ".join(spec.requires) if spec.requires else "none"
-        filt = spec.filter_of if spec.filter_of is not None else "none"
-        print(f"{spec.name}: requires={requires}; filter_of={filt}")
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+        table_rows.append((f"wf{idx
