@@ -161,6 +161,12 @@ def compute_metrics(trades: list[TradeResult]) -> dict[str, Any]:
             "max_drawdown": 0.0,
             "sharpe": 0.0,
             "avg_trade_duration_bars": 0.0,
+            "long_trades": 0,
+            "short_trades": 0,
+            "long_win_rate": 0.0,
+            "short_win_rate": 0.0,
+            "long_net_pnl": 0.0,
+            "short_net_pnl": 0.0,
         }
 
     pnls = np.array([trade.net_pnl for trade in trades], dtype=float)
@@ -172,6 +178,18 @@ def compute_metrics(trades: list[TradeResult]) -> dict[str, Any]:
     drawdown = peak - equity
     r_std = float(np.std(rs, ddof=1)) if len(rs) > 1 else 0.0
 
+    # Long/short breakdown
+    long_trades = [t for t in trades if t.direction == "long"]
+    short_trades = [t for t in trades if t.direction == "short"]
+
+    long_pnls = np.array([t.net_pnl for t in long_trades], dtype=float)
+    short_pnls = np.array([t.net_pnl for t in short_trades], dtype=float)
+
+    long_win_rate = float((long_pnls > 0).mean()) if len(long_pnls) > 0 else 0.0
+    short_win_rate = float((short_pnls > 0).mean()) if len(short_pnls) > 0 else 0.0
+    long_net_pnl = float(long_pnls.sum())
+    short_net_pnl = float(short_pnls.sum())
+
     return {
         "total_trades": int(len(trades)),
         "win_rate": float((pnls > 0).mean()),
@@ -181,6 +199,12 @@ def compute_metrics(trades: list[TradeResult]) -> dict[str, Any]:
         "max_drawdown": float(drawdown.max(initial=0.0)),
         "sharpe": float(np.mean(rs) / r_std * np.sqrt(252.0)) if r_std > 0 else 0.0,
         "avg_trade_duration_bars": float(np.mean([trade.bars_held for trade in trades])),
+        "long_trades": int(len(long_trades)),
+        "short_trades": int(len(short_trades)),
+        "long_win_rate": long_win_rate,
+        "short_win_rate": short_win_rate,
+        "long_net_pnl": long_net_pnl,
+        "short_net_pnl": short_net_pnl,
     }
 
 
@@ -350,6 +374,45 @@ def wf_oos_folds_for_selected_params(
         )
         attach_sequential_topstep_oos(oos)
         out.append(oos)
+    return out
+
+
+def wf_train_test_trades_for_selected_params(
+    frame: pd.DataFrame,
+    strategy_name: str,
+    timeframe: str,
+    selected_params: dict[str, Any],
+    windows: PipelineWindows,
+    *,
+    risk_dollars: float = DEFAULT_RISK_DOLLARS,
+    max_contracts: int | None = None,
+) -> list[tuple[list[TradeResult], list[TradeResult]]]:
+    """Extract (train_trades, test_trades) tuples for each WF fold.
+
+    Mirrors wf_oos_folds_for_selected_params but returns trade pairs instead of EvaluationResults.
+    Used by position sizing optimizers that need both train and test trade sequences.
+    """
+    out: list[tuple[list[TradeResult], list[TradeResult]]] = []
+    for wf in windows.walk_forward:
+        train = evaluate_strategy(
+            frame,
+            strategy_name,
+            timeframe,
+            selected_params,
+            wf.train,
+            risk_dollars=risk_dollars,
+            max_contracts=max_contracts,
+        )
+        test = evaluate_strategy(
+            frame,
+            strategy_name,
+            timeframe,
+            selected_params,
+            wf.test,
+            risk_dollars=risk_dollars,
+            max_contracts=max_contracts,
+        )
+        out.append((train.trades, test.trades))
     return out
 
 

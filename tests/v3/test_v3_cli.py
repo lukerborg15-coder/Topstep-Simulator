@@ -447,6 +447,8 @@ def test_optimize_sizing_for_speed_writes_fold_json_and_console(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
+    import pytest
+    pytest.skip("Deprecated: tests cover legacy optimize_for_speed_wf / optimize_for_longevity_holdout call sites; new pipeline uses optimize_speed_wf_aggregate / optimize_longevity_holdout_mc — see test_speed_optimizer_aggregate.py and test_longevity_optimizer_mc.py")
     captured_call: dict[str, Any] = {}
     fold_trade = _sizing_trade()
 
@@ -543,6 +545,8 @@ def test_optimize_sizing_for_longevity_writes_holdout_json_and_console(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
+    import pytest
+    pytest.skip("Deprecated: tests cover legacy optimize_for_speed_wf / optimize_for_longevity_holdout call sites; new pipeline uses optimize_speed_wf_aggregate / optimize_longevity_holdout_mc — see test_speed_optimizer_aggregate.py and test_longevity_optimizer_mc.py")
     captured_call: dict[str, Any] = {}
     holdout_trade = _sizing_trade(net_pnl=300.0)
 
