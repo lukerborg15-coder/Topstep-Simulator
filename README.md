@@ -161,29 +161,30 @@ topstep-pipeline --strategy hl2_sma_retrace_atr --mode holdout-only
 
 ## Contract / Sizing Optimizers
 
-Two post-evaluation stages in `position_sizing.py`. Both grid-search over risk levels (default `[$50, $75, $100, $150, $200, $300, $400, $500]`), resize all trades at each level, and rank candidates on a robust objective. Results saved to JSON in `output/`.
+Two post-evaluation stages in `position_sizing.py`. Both grid-search over risk levels (default `$50` to `$950` in `$50` increments), resize all trades at each level, and rank candidates on a robust objective. Coverage filtering still rejects risk levels that cannot produce enough trades with at least one contract. Results saved to JSON in `output/`.
 
 ### Speed Optimizer (`--optimize-sizing-for-speed`)
 
 **Goal:** find the risk-per-trade that gets you through the Topstep Combine fastest with a high pass rate. Soft target is **≤ 10 days to pass**.
 
-**Method (V2 — train-fit, OOS-evaluate, aggregate):**
+**Method (V2 — train-fit, OOS-evaluate, aggregate, adaptive floor):**
 1. For each WF fold, optimize on the **training** trades only (no OOS peeking).
 2. Cap each evaluation chain at `--speed-attempt-budget` (default 10) — pass rate is `passes / min(N, attempts)`, comparable across risk levels.
 3. Filter risks via coverage threshold: each risk must produce ≥ 1 contract on ≥ `--risk-coverage-threshold` (default 50%) of trades.
 4. Compute median, mean, IQR, p90, std (ddof=1) of `days_to_pass`.
-5. Rank candidates by **utility = pass_rate × exp(-max(0, median_days − target) / 5)** with target = `--speed-target-days` (default 10). Soft penalty past 10 days.
-6. Evaluate the train-winner on the OOS fold to record honest test performance.
-7. Aggregate across folds: keep risks viable in ≥ ⌈N/2⌉ folds; rank by **median OOS utility**, tiebreak by **worst-fold utility**.
+5. **Adaptive pass-rate floor:** `--pass-floor-pct` now acts as a CEILING. Per fold, compute `effective_floor = min(user_floor, max(20.0, best_train_pass_rate × 0.7))`. If best train pass rate is low (e.g. 35%), floor relaxes to 24.5% so candidates aren't all rejected. Hard minimum of 20% prevents runaway. Reported in output as `effective_pass_floor_pct` and `adaptive_floor_applied`.
+6. Rank candidates by **utility = pass_rate × exp(-max(0, median_days − target) / 5)** with target = `--speed-target-days` (default 10). Soft penalty past 10 days.
+7. Evaluate the train-winner on the OOS fold to record honest test performance.
+8. Aggregate across folds: in the default two-fold setup, keep only risks viable in both folds (explicit `min_viable_folds` overrides still apply); rank by **median OOS utility**, tiebreak by **worst-fold utility**.
 
-**Output:** `output/<strategy>_wf_speed_optimization_aggregate.json` (the deliverable). Per-fold diagnostics still written as `output/<strategy>_wf<N>_speed_optimization_diagnostic.json`.
+**Output:** `output/json/<strategy>_wf_speed_optimization_aggregate.json` (the deliverable). Aggregate `effective_pass_floor_pct` is the median of per-fold effective floors; `adaptive_floor_applied` is True if any fold triggered the relaxation.
 
 | Flag | Default | Description |
 |---|---|---|
 | `--optimize-sizing-for-speed` | off | Enable speed optimizer |
 | `--speed-attempt-budget` | `10` | Max sequential eval attempts per fold/risk |
 | `--speed-target-days` | `10.0` | Soft ceiling for days-to-pass; utility decays past this |
-| `--pass-floor-pct` | `40.0` | Min train pass rate % to qualify as viable |
+| `--pass-floor-pct` | `40.0` | Pass rate ceiling — adaptive floor relaxes if train pass rates are low (min 20%) |
 | `--risk-coverage-threshold` | `0.5` | Min fraction of trades that must produce ≥ 1 contract |
 
 ### Longevity Optimizer (`--optimize-sizing-for-longevity`)
@@ -253,10 +254,10 @@ The text summary (`output/txt summaries/<strategy>_<tf>_result_summary.txt`) put
 
 | Window | Start | End |
 |---|---|---|
-| WF1 train | 2022-09-01 | 2023-08-31 |
-| WF1 test | 2023-09-01 | 2024-02-29 |
-| WF2 train | 2022-09-01 | 2024-02-29 |
-| WF2 test | 2024-03-01 | 2024-08-31 |
+| WF1 train | 2021-03-19 | 2023-02-28 |
+| WF1 test | 2023-03-01 | 2023-11-30 |
+| WF2 train | 2021-03-19 | 2023-11-30 |
+| WF2 test | 2023-12-01 | 2024-08-31 |
 | Holdout | 2024-09-01 | 2026-03-18 |
 
 Override with `--pipeline-config config/your_windows.json`. See `config/README.md` for JSON schema.
@@ -287,11 +288,16 @@ All thresholds are overridable via `--reject-*` / `--ready-*` CLI flags.
 
 ```
 output/
-  json/            <strategy>_<timeframe>_result.json    — full result bundle
-  txt summaries/   <strategy>_<timeframe>_result_summary.txt
+  json/            <strategy>_<timeframe>_result.json              — full result bundle
+                   <strategy>_wf_speed_optimization_aggregate.json — speed optimizer output
+                   <strategy>_holdout_longevity_optimization_mc.json — longevity optimizer output
+                   <strategy>_sizing_comparison.json               — sizing comparison output
+  txt summaries/   <strategy>_<timeframe>_result_summary.txt       — human-readable pipeline report
   graphs/          MC path plots, sensitivity heatmaps (.png)
   frozen_params/   SHA-256 hashed param files + audit_log.jsonl
 ```
+
+**Re-run behavior:** files are named by `<strategy>_<timeframe>` and overwrite on re-run with same args. To preserve runs, pass a unique `--output-dir`.
 
 ---
 

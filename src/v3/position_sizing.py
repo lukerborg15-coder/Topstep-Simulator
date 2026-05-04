@@ -31,6 +31,28 @@ from .funded_express_sim import simulate_express_funded_resets
 from .topstep import count_sequential_eval_passes
 from .trades import TradeResult
 
+DEFAULT_RISK_GRID: tuple[float, ...] = tuple(float(v) for v in range(50, 1000, 50))
+
+# Adaptive pass-rate floor for speed optimizer. The user-supplied --pass-floor-pct
+# becomes a CEILING; the actual floor is min(user_floor, max(MIN_FLOOR_FLOOR,
+# best_train_pass_rate * ADAPTIVE_FLOOR_RATIO)).
+ADAPTIVE_FLOOR_RATIO: float = 0.7
+MIN_FLOOR_FLOOR: float = 20.0
+
+
+def _compute_adaptive_floor(
+    best_train_pass_rate: float, user_floor: float
+) -> tuple[float, float, bool]:
+    """Return (effective_floor, adaptive_floor, adaptive_applied).
+
+    Spec: adaptive = max(MIN_FLOOR_FLOOR, best * RATIO); effective = min(user, adaptive).
+    adaptive_applied is True when effective < user_floor (user floor was relaxed).
+    """
+    adaptive = max(MIN_FLOOR_FLOOR, best_train_pass_rate * ADAPTIVE_FLOOR_RATIO)
+    effective = min(user_floor, adaptive)
+    applied = effective < user_floor
+    return effective, adaptive, applied
+
 
 # =============================================================================
 # Dataclasses
@@ -88,6 +110,10 @@ class SpeedOptimizationAggregateResult:
     viable_folds: int
     per_fold_oos: tuple[dict[str, Any], ...] = ()
     candidates: tuple[dict[str, Any], ...] = ()
+    all_candidates: tuple[dict[str, Any], ...] = ()
+    effective_pass_floor_pct: float = 0.0
+    adaptive_floor_applied: bool = False
+    per_fold_floors: tuple[dict[str, Any], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -421,7 +447,19 @@ def optimize_for_speed_wf(
         m = _evaluate_risk_on_trades(trades, risk, rules, attempt_budget=1000, instrument=instrument)
         results.append(m)
 
-    viable = [r for r in results if r["pass_rate_pct"] >= pass_floor_pct]
+    # Adaptive pass floor (consistent with optimize_speed_wf_aggregate).
+    pass_rates = [r["pass_rate_pct"] for r in results]
+    best_pass = max(pass_rates) if pass_rates else 0.0
+    effective_floor, _adaptive, adaptive_applied = _compute_adaptive_floor(
+        best_pass, pass_floor_pct
+    )
+    if adaptive_applied:
+        print(
+            f"Adaptive pass floor: {effective_floor:.1f}% "
+            f"(best train pass rate: {best_pass:.1f}%, user floor: {pass_floor_pct:.1f}%)"
+        )
+
+    viable = [r for r in results if r["pass_rate_pct"] >= effective_floor]
     if not viable:
         return replace(empty, candidates=tuple(results))
 
@@ -549,41 +587,92 @@ def optimize_speed_wf_aggregate(
         median_oos_pass_rate_pct=0.0,
         median_oos_median_days_to_pass=0.0,
         viable_folds=0,
+        effective_pass_floor_pct=pass_floor_pct,
+        adaptive_floor_applied=False,
     )
     if n_folds == 0:
         return empty
 
-    # For each risk level, evaluate train+test on every fold.
-    per_risk: dict[float, dict[str, Any]] = {}
-    for risk in risk_levels:
-        train_utilities: list[float] = []
-        oos_metrics: list[dict[str, Any]] = []
-        viable_train = 0
-        for fold_idx, (train_trades, test_trades) in enumerate(fold_trade_pairs):
+    # Fold-major two-phase evaluation. For each fold:
+    #   Phase 1: evaluate every risk on train (no gating).
+    #   Phase 2: compute best train pass rate across all risks for this fold.
+    #   Phase 3: derive effective floor = min(user, max(MIN_FLOOR_FLOOR, best * RATIO)).
+    #   Phase 4: gate train results, then evaluate OOS for survivors.
+    per_risk_buckets: dict[float, dict[str, Any]] = {
+        risk: {"oos_metrics": [], "viable_folds": 0} for risk in risk_levels
+    }
+    fold_floor_records: list[dict[str, Any]] = []
+
+    for fold_idx, (train_trades, test_trades) in enumerate(fold_trade_pairs):
+        # Phase 1: train evaluation per risk
+        fold_train: dict[float, dict[str, Any] | None] = {}
+        for risk in risk_levels:
             valid_for_fold = _get_valid_risk_levels(
                 train_trades, [risk], instrument, coverage_threshold=coverage_threshold
             )
             if not valid_for_fold:
-                oos_metrics.append({"fold_index": fold_idx, "risk_dollars": risk, "viable": False})
+                fold_train[risk] = None
                 continue
-            train_m = _evaluate_risk_on_trades(train_trades, risk, rules, attempt_budget, instrument)
+            train_m = _evaluate_risk_on_trades(
+                train_trades, risk, rules, attempt_budget, instrument
+            )
             train_m["utility"] = _speed_utility(
                 train_m["pass_rate_pct"] / 100.0, train_m["median_days_to_pass"], speed_target_days
             )
-            if train_m["utility"] <= 0 or train_m["pass_rate_pct"] < pass_floor_pct:
-                oos_metrics.append({"fold_index": fold_idx, "risk_dollars": risk, "viable": False})
+            fold_train[risk] = train_m
+
+        # Phase 2 + 3: best train pass rate, adaptive floor
+        train_pass_rates = [m["pass_rate_pct"] for m in fold_train.values() if m is not None]
+        best_pass = max(train_pass_rates) if train_pass_rates else 0.0
+        effective_floor, adaptive, adaptive_applied = _compute_adaptive_floor(
+            best_pass, pass_floor_pct
+        )
+        fold_floor_records.append({
+            "fold_index": fold_idx,
+            "best_train_pass_rate_pct": best_pass,
+            "adaptive_floor_pct": adaptive,
+            "effective_floor_pct": effective_floor,
+            "user_floor_pct": pass_floor_pct,
+            "adaptive_applied": adaptive_applied,
+        })
+        if adaptive_applied:
+            print(
+                f"Adaptive pass floor: {effective_floor:.1f}% "
+                f"(best train pass rate: {best_pass:.1f}%, user floor: {pass_floor_pct:.1f}%) "
+                f"[fold {fold_idx}]"
+            )
+
+        # Phase 4: gate + OOS
+        for risk in risk_levels:
+            train_m = fold_train.get(risk)
+            bucket = per_risk_buckets[risk]
+            if train_m is None:
+                bucket["oos_metrics"].append(
+                    {"fold_index": fold_idx, "risk_dollars": risk, "viable": False}
+                )
                 continue
-            viable_train += 1
-            train_utilities.append(train_m["utility"])
-            test_m = _evaluate_risk_on_trades(test_trades, risk, rules, attempt_budget, instrument)
+            if train_m["utility"] <= 0 or train_m["pass_rate_pct"] < effective_floor:
+                bucket["oos_metrics"].append(
+                    {"fold_index": fold_idx, "risk_dollars": risk, "viable": False}
+                )
+                continue
+            bucket["viable_folds"] += 1
+            test_m = _evaluate_risk_on_trades(
+                test_trades, risk, rules, attempt_budget, instrument
+            )
             test_m["utility"] = _speed_utility(
                 test_m["pass_rate_pct"] / 100.0, test_m["median_days_to_pass"], speed_target_days
             )
             test_m["viable"] = True
             test_m["fold_index"] = fold_idx
             test_m["train_utility"] = train_m["utility"]
-            oos_metrics.append(test_m)
+            bucket["oos_metrics"].append(test_m)
 
+    # Aggregate per_risk results
+    per_risk: dict[float, dict[str, Any]] = {}
+    for risk in risk_levels:
+        bucket = per_risk_buckets[risk]
+        oos_metrics = bucket["oos_metrics"]
         oos_utilities = [m["utility"] for m in oos_metrics if m.get("viable")]
         oos_pass_rates = [m["pass_rate_pct"] for m in oos_metrics if m.get("viable")]
         oos_medians = [
@@ -593,7 +682,7 @@ def optimize_speed_wf_aggregate(
         ]
         per_risk[risk] = {
             "risk_dollars": risk,
-            "viable_folds": viable_train,
+            "viable_folds": bucket["viable_folds"],
             "median_oos_utility": float(np.median(oos_utilities)) if oos_utilities else 0.0,
             "min_oos_utility": float(min(oos_utilities)) if oos_utilities else 0.0,
             "median_oos_pass_rate_pct": float(np.median(oos_pass_rates)) if oos_pass_rates else 0.0,
@@ -601,11 +690,24 @@ def optimize_speed_wf_aggregate(
             "per_fold": tuple(oos_metrics),
         }
 
+    # Aggregate floor surface: median across folds; adaptive_applied if any fold triggered
+    fold_effective_floors = [r["effective_floor_pct"] for r in fold_floor_records]
+    aggregate_effective_floor = (
+        float(np.median(fold_effective_floors)) if fold_effective_floors else pass_floor_pct
+    )
+    any_adaptive = any(r["adaptive_applied"] for r in fold_floor_records)
+
     survivors = [c for c in per_risk.values() if c["viable_folds"] >= min_viable_folds]
+    all_candidates = tuple(sorted(per_risk.values(), key=lambda c: -c["median_oos_utility"]))
     if not survivors:
-        # Return all as candidates so user sees the data
-        all_candidates = tuple(sorted(per_risk.values(), key=lambda c: -c["median_oos_utility"]))
-        return replace(empty, candidates=all_candidates[:5])
+        return replace(
+            empty,
+            candidates=all_candidates[:5],
+            all_candidates=all_candidates,
+            effective_pass_floor_pct=aggregate_effective_floor,
+            adaptive_floor_applied=any_adaptive,
+            per_fold_floors=tuple(fold_floor_records),
+        )
 
     survivors_sorted = sorted(
         survivors,
@@ -628,6 +730,10 @@ def optimize_speed_wf_aggregate(
         viable_folds=best["viable_folds"],
         per_fold_oos=best["per_fold"],
         candidates=tuple(top_5),
+        all_candidates=all_candidates,
+        effective_pass_floor_pct=aggregate_effective_floor,
+        adaptive_floor_applied=any_adaptive,
+        per_fold_floors=tuple(fold_floor_records),
     )
 
 
@@ -790,6 +896,10 @@ def optimize_longevity_holdout_mc(
 
 
 __all__ = [
+    "DEFAULT_RISK_GRID",
+    "ADAPTIVE_FLOOR_RATIO",
+    "MIN_FLOOR_FLOOR",
+    "_compute_adaptive_floor",
     "SpeedOptimizationResult",
     "LongevityOptimizationResult",
     "SpeedOptimizationAggregateResult",

@@ -48,6 +48,7 @@ from .json_readable import write_readable_text_from_json_file
 from .monte_carlo import MCResult, mc_summary_dict, mc_summary_text, plot_mc_paths, run_mc
 from .pipeline_config import resolve_windows
 from .position_sizing import (
+    DEFAULT_RISK_GRID,
     LongevityOptimizationMCResult,
     LongevityOptimizationResult,
     SpeedOptimizationAggregateResult,
@@ -306,6 +307,13 @@ def _print_speed_optimization_aggregate(result: SpeedOptimizationAggregateResult
     print(f"Median OOS Pass Rate: {result.median_oos_pass_rate_pct:.1f}%")
     print(f"Median OOS Median Days: {result.median_oos_median_days_to_pass:.1f} days")
     print(f"Viable in {result.viable_folds}/{result.n_folds} folds")
+    if result.adaptive_floor_applied:
+        print(
+            f"Pass floor (effective/user): {result.effective_pass_floor_pct:.1f}% / "
+            f"{result.pass_floor_pct:.1f}% (adaptive applied)"
+        )
+    else:
+        print(f"Pass floor: {result.effective_pass_floor_pct:.1f}%")
     print()
     print("Top 5 alternatives:")
     if not result.candidates:
@@ -365,11 +373,17 @@ def _print_longevity_optimization_mc(result: LongevityOptimizationMCResult) -> N
         print("(no candidates)")
         return
     for idx, candidate in enumerate(result.candidates[:5], 1):
-        print(
-            f"{idx}. {_money(float(candidate['risk_dollars']))}  "
-            f"med_long={float(candidate['median_longevity_score']):.4f}  "
-            f"p05_long={float(candidate['p05_longevity_score']):.4f}"
-        )
+        if candidate.get("rejected"):
+            print(
+                f"{idx}. {_money(float(candidate['risk_dollars']))}  "
+                f"REJECTED — {candidate.get('reject_reason', 'unknown')}"
+            )
+        else:
+            print(
+                f"{idx}. {_money(float(candidate['risk_dollars']))}  "
+                f"med_long={float(candidate['median_longevity_score']):.4f}  "
+                f"p05_long={float(candidate['p05_longevity_score']):.4f}"
+            )
 
 
 def _resolve_frozen_dir(output_dir: Path, frozen_explicit: Path | None) -> Path:
@@ -439,6 +453,8 @@ def main(argv: list[str] | None = None) -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
     graphs_dir = output_dir / "graphs"
     graphs_dir.mkdir(parents=True, exist_ok=True)
+    json_dir = output_dir / "json"
+    json_dir.mkdir(parents=True, exist_ok=True)
     frozen_explicit = Path(args.frozen_params_dir).resolve() if args.frozen_params_dir else None
     frozen_root = _resolve_frozen_dir(output_dir, frozen_explicit)
 
@@ -543,13 +559,13 @@ def main(argv: list[str] | None = None) -> int:
             speed_optimization_aggregate_result = optimize_speed_wf_aggregate(
                 fold_trade_pairs,
                 strategy=strategy_key,
-                risk_levels=[50.0, 75.0, 100.0, 150.0, 200.0, 300.0, 400.0, 500.0],
+                risk_levels=list(DEFAULT_RISK_GRID),
                 pass_floor_pct=args.pass_floor_pct,
                 speed_target_days=args.speed_target_days,
                 attempt_budget=args.speed_attempt_budget,
                 coverage_threshold=args.risk_coverage_threshold,
             )
-            speed_path = output_dir / f"{strategy_key}_wf_speed_optimization_aggregate.json"
+            speed_path = json_dir / f"{strategy_key}_wf_speed_optimization_aggregate.json"
             _write_optimization_json(speed_path, speed_optimization_aggregate_result)
             speed_optimization_paths.append(str(speed_path.resolve()))
             _print_speed_optimization_aggregate(speed_optimization_aggregate_result)
@@ -692,7 +708,7 @@ def main(argv: list[str] | None = None) -> int:
             confidence_level=args.longevity_confidence_level,
             coverage_threshold=args.risk_coverage_threshold,
         )
-        longevity_path = output_dir / f"{strategy_key}_holdout_longevity_optimization_mc.json"
+        longevity_path = json_dir / f"{strategy_key}_holdout_longevity_optimization_mc.json"
         _write_optimization_json(longevity_path, longevity_optimization_mc_result)
         longevity_optimization_path = str(longevity_path.resolve())
         _print_longevity_optimization_mc(longevity_optimization_mc_result)
@@ -712,7 +728,7 @@ def main(argv: list[str] | None = None) -> int:
                 fixed_risk_dollars=args.compare_fixed_risk,
                 fixed_contracts=args.compare_fixed_contracts,
             )
-            comparison_path = output_dir / f"{strategy_key}_sizing_comparison.json"
+            comparison_path = json_dir / f"{strategy_key}_sizing_comparison.json"
             payload = _json_safe(asdict(sizing_comparison_result))
             comparison_path.write_text(json.dumps(payload, indent=2, sort_keys=False, default=str) + "\n")
             print()
@@ -861,8 +877,6 @@ def main(argv: list[str] | None = None) -> int:
         ),
     }
 
-    json_dir = output_dir / "json"
-    json_dir.mkdir(parents=True, exist_ok=True)
     out_json = json_dir / f"{strategy_key}_{args.timeframe}_result.json"
     out_json.write_text(json.dumps(result_bundle, indent=2, sort_keys=False, default=str) + "\n")
     txt_dir = output_dir / "txt summaries"
@@ -904,4 +918,28 @@ def main(argv: list[str] | None = None) -> int:
     if sensitivity_heatmap_path is not None:
         table_rows.append(("sensitivity_mc_graph", sensitivity_heatmap_path))
     for idx, path in enumerate(speed_optimization_paths, 1):
-        table_rows.append((f"wf{idx
+        table_rows.append((f"wf{idx}_speed_optimization", path))
+    if longevity_optimization_path is not None:
+        table_rows.append(("holdout_longevity_optimization", longevity_optimization_path))
+    if params_hash is not None and audit_path is not None:
+        table_rows.extend(
+            [
+                ("frozen_params_sha256", params_hash[:16] + "..."),
+                ("audit_stamp", str(audit_path.resolve())),
+                ("audit_log_jsonl", str(log_path.resolve())),
+            ]
+        )
+    _print_summary_table(table_rows)
+    return 0
+
+
+def _print_strategies() -> None:
+    for key in sorted(STRATEGIES):
+        spec = STRATEGIES[key]
+        requires = ", ".join(spec.requires) if spec.requires else "none"
+        filt = spec.filter_of if spec.filter_of is not None else "none"
+        print(f"{spec.name}: requires={requires}; filter_of={filt}")
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
