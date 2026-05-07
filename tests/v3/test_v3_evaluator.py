@@ -330,6 +330,41 @@ def test_simulate_trades_applies_target_fill_commission_and_slippage() -> None:
     assert trade.r_multiple == expected_net / expected_risk
 
 
+def test_simulate_trades_does_not_force_flatten_at_session_end() -> None:
+    index = pd.DatetimeIndex(
+        [
+            pd.Timestamp("2024-01-02 15:55", tz=EASTERN_TZ),
+            pd.Timestamp("2024-01-02 16:05", tz=EASTERN_TZ),
+            pd.Timestamp("2024-01-02 18:05", tz=EASTERN_TZ),
+        ]
+    )
+    frame = pd.DataFrame(
+        {
+            "open": [100.0, 100.0, 100.0],
+            "high": [100.5, 100.75, 102.5],
+            "low": [99.5, 99.75, 99.75],
+            "close": [100.0, 100.25, 102.0],
+            "volume": [100, 100, 100],
+        },
+        index=index,
+    )
+    signal = TradeSignal(
+        time=frame.index[0],
+        direction="long",
+        entry=100.0,
+        stop=99.0,
+        target=102.0,
+        strategy="unit_eval",
+        params={"case": "overnight_target"},
+    )
+
+    trades = simulate_trades(frame, [signal], instrument=MNQ, risk_dollars=DEFAULT_RISK_DOLLARS)
+
+    assert len(trades) == 1
+    assert trades[0].exit_reason == "target"
+    assert trades[0].exit_time == frame.index[-1]
+
+
 def test_compute_metrics_returns_required_keys() -> None:
     frame = _synthetic_ohlcv()
     metrics = compute_metrics(simulate_trades(frame, _manual_signals(frame)))
@@ -505,6 +540,54 @@ def test_run_walk_forward_scores_with_avg_r_bonus_and_returns_param_mode(monkeyp
         "mode_candidate",
     ]
     assert wf_ok is False  # empty OOS trades -> seq passes 0 -> fallback
+
+
+def test_wf_train_test_trades_for_selected_params_forwards_instrument(monkeypatch: Any) -> None:
+    mes_probe = evaluator_module.Instrument(
+        symbol="MES",
+        point_value=5.0,
+        tick_size=0.25,
+        commission_round_turn=0.85,
+        slippage_points_per_side=0.25,
+    )
+    calls: list[tuple[str, str]] = []
+
+    def fake_evaluate_strategy(
+        frame: pd.DataFrame,
+        strategy_name: str,
+        timeframe: str,
+        params: dict[str, Any],
+        window: Any,
+        **kwargs: Any,
+    ) -> EvaluationResult:
+        calls.append((window.name, kwargs["instrument"].symbol))
+        return EvaluationResult(
+            strategy=strategy_name,
+            timeframe=timeframe,
+            params=dict(params),
+            window=window.name,
+            metrics={"avg_r": 0.0, "total_net_pnl": 0.0},
+            topstep={"topstep_passed": False, "topstep_score": 0.0},
+            trades=[],
+        )
+
+    monkeypatch.setattr(evaluator_module, "evaluate_strategy", fake_evaluate_strategy)
+
+    pairs = evaluator_module.wf_train_test_trades_for_selected_params(
+        pd.DataFrame(),
+        "unit_eval",
+        "5min",
+        {"width": 1.0},
+        WINDOWS,
+        instrument=mes_probe,
+    )
+
+    assert pairs == [([], []) for _ in WINDOWS.walk_forward]
+    assert calls == [
+        (window.name, "MES")
+        for wf in WINDOWS.walk_forward
+        for window in (wf.train, wf.test)
+    ]
 
 
 def test_robust_params_marks_met_when_enough_folds_hit_seq_threshold() -> None:

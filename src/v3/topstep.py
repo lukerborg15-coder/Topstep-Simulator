@@ -6,6 +6,7 @@ from typing import Any
 import pandas as pd
 
 from .config import TOPSTEP_50K, TopStepRules
+from .futures_session import futures_session_date, group_trades_by_futures_session_day
 from .trades import TradeResult
 
 
@@ -28,11 +29,7 @@ class TopStepResult:
 
 
 def _group_trades_by_day(trades: list[TradeResult]) -> dict[pd.Timestamp, list[TradeResult]]:
-    day_trades: dict[pd.Timestamp, list[TradeResult]] = {}
-    for trade in sorted(trades, key=lambda t: t.exit_time):
-        day = trade.exit_time.normalize()
-        day_trades.setdefault(day, []).append(trade)
-    return day_trades
+    return group_trades_by_futures_session_day(trades)
 
 
 def simulate_topstep_with_termination(
@@ -150,7 +147,7 @@ def count_sequential_eval_passes(
             passes += 1
         if term_day is None:
             break
-        next_remaining = [t for t in remaining if t.exit_time.normalize() > term_day]
+        next_remaining = [t for t in remaining if futures_session_date(t.exit_time) > term_day]
         if not next_remaining:
             break
         remaining = next_remaining

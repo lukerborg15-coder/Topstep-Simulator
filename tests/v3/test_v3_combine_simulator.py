@@ -242,3 +242,15 @@ def test_n_trading_days_reflects_input_day_count():
     result = run_combine_simulator(trades, n_resamples=10, seed=1)
     assert result.n_trading_days == 20
     assert result.n_trades == 20
+
+
+def test_futures_session_grouping_merges_overnight_and_next_morning() -> None:
+    trades = [
+        _trade("2025-06-02 18:05", 200.0),
+        _trade("2025-06-03 09:30", 200.0),
+        _trade("2025-06-03 18:05", 200.0),
+    ]
+
+    result = run_combine_simulator(trades, n_resamples=5, seed=1)
+
+    assert result.n_trading_days == 2
