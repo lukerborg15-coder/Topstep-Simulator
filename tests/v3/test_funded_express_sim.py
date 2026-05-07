@@ -174,3 +174,18 @@ def test_rich_metrics_all_losers_and_single_trade_edges():
     assert single.current_profit_factor == math.inf
     assert single.current_sharpe_annualized == 0.0
     assert single.stints_summary[0]["profit_factor"] == math.inf
+
+
+def test_breach_resets_skip_remaining_trades_in_same_futures_session() -> None:
+    rules = FundedExpressSimRules()
+    trades = [
+        _trade(_ts(2, 18, 5), -2100.0, r_multiple=-2.1),
+        _trade(_ts(3, 9, 30), 300.0, r_multiple=0.3),
+        _trade(_ts(3, 18, 5), 400.0, r_multiple=0.4),
+    ]
+
+    result = simulate_express_funded_resets(trades, rules=rules)
+
+    assert result.stints_opened == 2
+    assert result.stints_summary[0]["breached"] is True
+    assert result.stints_summary[1]["trades_applied_count"] == 1

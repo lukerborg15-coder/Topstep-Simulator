@@ -10,12 +10,11 @@ from .combine_simulator import CombineSimResult
 from .config import (
     DEFAULT_MAX_CONTRACTS,
     DEFAULT_RISK_DOLLARS,
+    Instrument,
     MNQ,
     SCORING_WEIGHTS,
-    SESSION_END,
     TOPSTEP_50K,
     DateWindow,
-    Instrument,
     PipelineWindows,
     WINDOWS,
 )
@@ -68,7 +67,6 @@ def simulate_trades(
     if frame.empty or not signals:
         return []
 
-    session_end_time = pd.Timestamp(SESSION_END).time()
     trades: list[TradeResult] = []
     for signal in sorted(signals, key=lambda item: item.time):
         if signal.time not in frame.index:
@@ -106,11 +104,6 @@ def simulate_trades(
                 exit_price = signal.target
                 exit_time = ts
                 exit_reason = "target"
-                break
-            if ts.time() >= session_end_time:
-                exit_price = float(row["close"])
-                exit_time = ts
-                exit_reason = "session_end"
                 break
         else:
             exit_price = float(frame["close"].iloc[-1])
@@ -231,6 +224,7 @@ def evaluate_strategy(
     params: dict[str, Any],
     window: DateWindow,
     *,
+    instrument: Instrument = MNQ,
     risk_dollars: float = DEFAULT_RISK_DOLLARS,
     max_contracts: int | None = None,
 ) -> EvaluationResult:
@@ -242,7 +236,13 @@ def evaluate_strategy(
     if "pivot_levels" in spec.requires:
         signal_frame = attach_pivot_levels(sliced, raw_frame=frame)
     signals = spec.generate(signal_frame, active_params)
-    trades = simulate_trades(sliced, signals, risk_dollars=risk_dollars, max_contracts=max_contracts)
+    trades = simulate_trades(
+        sliced,
+        signals,
+        instrument=instrument,
+        risk_dollars=risk_dollars,
+        max_contracts=max_contracts,
+    )
     metrics = compute_metrics(trades)
     topstep = topstep_summary_dict(simulate_topstep(trades))
     return EvaluationResult(
@@ -276,6 +276,7 @@ def run_walk_forward(
     min_folds_meeting_passes: int | None = None,
     windows: PipelineWindows | None = None,
     *,
+    instrument: Instrument = MNQ,
     risk_dollars: float = DEFAULT_RISK_DOLLARS,
     max_contracts: int | None = None,
 ) -> tuple[dict[str, Any], list[EvaluationResult], bool]:
@@ -313,14 +314,30 @@ def run_walk_forward(
 
     for wf in wf_list:
         train_results = [
-            evaluate_strategy(frame, strategy_name, timeframe, params, wf.train, risk_dollars=risk_dollars, max_contracts=max_contracts)
+            evaluate_strategy(
+                frame,
+                strategy_name,
+                timeframe,
+                params,
+                wf.train,
+                instrument=instrument,
+                risk_dollars=risk_dollars,
+                max_contracts=max_contracts,
+            )
             for params in candidates
         ]
         train_best = max(train_results, key=_score_result)
         train_best_results.append(train_best)
         selected_params.append(train_best.params)
         oos = evaluate_strategy(
-            frame, strategy_name, timeframe, train_best.params, wf.test, risk_dollars=risk_dollars, max_contracts=max_contracts
+            frame,
+            strategy_name,
+            timeframe,
+            train_best.params,
+            wf.test,
+            instrument=instrument,
+            risk_dollars=risk_dollars,
+            max_contracts=max_contracts,
         )
         attach_sequential_topstep_oos(oos)
         oos_folds.append(oos)
@@ -358,6 +375,7 @@ def wf_oos_folds_for_selected_params(
     selected_params: dict[str, Any],
     windows: PipelineWindows,
     *,
+    instrument: Instrument = MNQ,
     risk_dollars: float = DEFAULT_RISK_DOLLARS,
     max_contracts: int | None = None,
 ) -> list[EvaluationResult]:
@@ -369,6 +387,7 @@ def wf_oos_folds_for_selected_params(
             timeframe,
             selected_params,
             wf.test,
+            instrument=instrument,
             risk_dollars=risk_dollars,
             max_contracts=max_contracts,
         )
@@ -384,6 +403,7 @@ def wf_train_test_trades_for_selected_params(
     selected_params: dict[str, Any],
     windows: PipelineWindows,
     *,
+    instrument: Instrument = MNQ,
     risk_dollars: float = DEFAULT_RISK_DOLLARS,
     max_contracts: int | None = None,
 ) -> list[tuple[list[TradeResult], list[TradeResult]]]:
@@ -400,6 +420,7 @@ def wf_train_test_trades_for_selected_params(
             timeframe,
             selected_params,
             wf.train,
+            instrument=instrument,
             risk_dollars=risk_dollars,
             max_contracts=max_contracts,
         )
@@ -409,6 +430,7 @@ def wf_train_test_trades_for_selected_params(
             timeframe,
             selected_params,
             wf.test,
+            instrument=instrument,
             risk_dollars=risk_dollars,
             max_contracts=max_contracts,
         )

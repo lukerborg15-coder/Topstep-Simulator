@@ -945,3 +945,134 @@ def test_sensitivity_runs_and_appears_in_result(
     assert "sensitivity_param_results" in sens
     assert "width" in sens["sensitivity_param_results"]
     assert blob["verdict"]["sensitivity_flag"] is False
+
+
+def test_cli_passes_mes_instrument_into_sizing_comparison(
+    cli_mock_registered: None,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+    holdout_trade = _sizing_trade(net_pnl=150.0)
+
+    monkeypatch.setattr(cli, "load_ohlcv", lambda **kwargs: synthetic_narrow_frame())
+    monkeypatch.setattr(
+        cli,
+        "run_walk_forward",
+        lambda *args, **kwargs: (dict(MOCK_CLI_SPEC.default_params), [_fake_eval(window="WF1"), _fake_eval(window="WF2")], True),
+    )
+    monkeypatch.setattr(
+        cli,
+        "wf_oos_folds_for_selected_params",
+        lambda *args, **kwargs: [_fake_eval(window="WF1"), _fake_eval(window="WF2")],
+    )
+    def fake_wf_train_test_trades_for_selected_params(*args: Any, **kwargs: Any) -> list[tuple[list[TradeResult], list[TradeResult]]]:
+        captured["fold_pairs_instrument"] = kwargs.get("instrument")
+        return [([holdout_trade], [holdout_trade])]
+
+    monkeypatch.setattr(
+        cli,
+        "wf_train_test_trades_for_selected_params",
+        fake_wf_train_test_trades_for_selected_params,
+    )
+    monkeypatch.setattr(cli, "evaluate_strategy", lambda *args, **kwargs: _fake_eval(window="holdout", trade_results=[holdout_trade]))
+    monkeypatch.setattr(cli, "_write_optimization_json", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        cli,
+        "optimize_speed_wf_aggregate",
+        lambda *args, **kwargs: type(
+            "SpeedStub",
+            (),
+            {
+                "optimal_risk_dollars": 100.0,
+                "median_oos_utility": 1.0,
+                "min_oos_utility": 1.0,
+                "median_oos_pass_rate_pct": 60.0,
+                "median_oos_median_days_to_pass": 8.0,
+                "viable_folds": 1,
+                "n_folds": 1,
+                "candidates": [],
+            },
+        )(),
+    )
+    monkeypatch.setattr(
+        cli,
+        "optimize_longevity_holdout_mc",
+        lambda *args, **kwargs: type(
+            "LongevityStub",
+            (),
+            {
+                "optimal_risk_dollars": 80.0,
+                "median_longevity_score": 1.0,
+                "p05_longevity_score": 1.0,
+                "median_avg_pnl_per_trade": 100.0,
+                "p05_avg_pnl_per_trade": 100.0,
+                "median_accounts_used": 1.0,
+                "median_accounts_blown": 0.0,
+                "median_components": {},
+                "p05_components": {},
+                "candidates": [],
+            },
+        )(),
+    )
+
+    def fake_run_sizing_comparison(*args: Any, **kwargs: Any) -> Any:
+        captured["instrument"] = kwargs["instrument"]
+        raise RuntimeError("stop after sizing comparison capture")
+
+    monkeypatch.setattr(cli, "run_sizing_comparison", fake_run_sizing_comparison)
+
+    with pytest.raises(RuntimeError, match="stop after sizing comparison capture"):
+        cli.main(
+            [
+                "--strategy", "cli_e2e_mock",
+                "--instrument", "mes",
+                "--timeframe", "5min",
+                "--data-dir", str(tmp_path),
+                "--output-dir", str(tmp_path / "out"),
+                "--optimize-sizing-for-speed",
+                "--optimize-sizing-for-longevity",
+                "--compare-fixed-risk", "100",
+                "--force",
+            ]
+        )
+
+    assert captured["fold_pairs_instrument"].symbol == "MES"
+    assert captured["instrument"].symbol == "MES"
+
+
+def test_full_sensitivity_trades_fn_uses_mes_instrument(
+    cli_mock_registered: None,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    monkeypatch.setattr(cli, "load_ohlcv", lambda **kwargs: synthetic_narrow_frame())
+
+    def fake_evaluate_strategy(*args: Any, **kwargs: Any) -> evaluator.EvaluationResult:
+        captured["instrument"] = kwargs.get("instrument")
+        return _fake_eval(window="sensitivity_probe")
+
+    def fake_run_sensitivity(*args: Any, **kwargs: Any) -> Any:
+        kwargs["trades_fn"](dict(MOCK_CLI_SPEC.default_params))
+        raise RuntimeError("stop after sensitivity capture")
+
+    monkeypatch.setattr(cli, "evaluate_strategy", fake_evaluate_strategy)
+    monkeypatch.setattr(cli, "run_sensitivity", fake_run_sensitivity)
+
+    with pytest.raises(RuntimeError, match="stop after sensitivity capture"):
+        cli.main(
+            [
+                "--strategy", "cli_e2e_mock",
+                "--instrument", "mes",
+                "--timeframe", "5min",
+                "--data-dir", str(tmp_path),
+                "--output-dir", str(tmp_path / "out_sensitivity_mes"),
+                "--skip-wf",
+                "--full",
+                "--force",
+            ]
+        )
+
+    assert captured["instrument"].symbol == "MES"
