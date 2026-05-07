@@ -194,7 +194,12 @@ def run_sizing_comparison(
 
     # Additional sanity flags
     if optimizer_speed_result.per_fold_oos:
-        viable_fold_count = len(set(p["fold_idx"] for p in optimizer_speed_result.per_fold_oos))
+        fold_ids = {
+            p.get("fold_index", p.get("fold_idx"))
+            for p in optimizer_speed_result.per_fold_oos
+            if p.get("viable") and p.get("fold_index", p.get("fold_idx")) is not None
+        }
+        viable_fold_count = len(fold_ids)
         if viable_fold_count < len(fold_trade_pairs):
             sanity_flags.append(f"Optimizer chose risk viable in only {viable_fold_count}/{len(fold_trade_pairs)} folds")
 

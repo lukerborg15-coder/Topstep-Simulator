@@ -125,6 +125,7 @@ def test_rich_metrics_span_breached_and_active_stints():
     assert first["survival_days"] == 2
     assert first["win_rate_pct"] == pytest.approx(100 / 3)
     assert first["avg_r_multiple"] == pytest.approx(-0.5)
+    assert first["sharpe_annualized"] < 0
     assert first["best_trade_pnl"] == 500
     assert first["worst_trade_pnl"] == -2600
     assert first["profit_factor"] == pytest.approx(500 / 2850)
@@ -132,6 +133,7 @@ def test_rich_metrics_span_breached_and_active_stints():
     assert second["survival_days"] == 1
     assert second["win_rate_pct"] == 100.0
     assert second["avg_r_multiple"] == 0.4
+    assert second["sharpe_annualized"] > 0
     assert second["best_trade_pnl"] == 300
     assert second["worst_trade_pnl"] == 100
     assert second["profit_factor"] == math.inf
@@ -174,3 +176,16 @@ def test_rich_metrics_all_losers_and_single_trade_edges():
     assert single.current_profit_factor == math.inf
     assert single.current_sharpe_annualized == 0.0
     assert single.stints_summary[0]["profit_factor"] == math.inf
+
+
+def test_funded_express_daily_loss_groups_overnight_trades_into_same_futures_session():
+    trades = [
+        _trade(_ts(2, 18, 5), -600.0),
+        _trade(_ts(3, 10, 0), -500.0),
+        _trade(_ts(4, 10, 0), 300.0),
+    ]
+
+    result = simulate_express_funded_resets(trades, rules=FundedExpressSimRules())
+
+    assert result.funded_accounts_failed == 0
+    assert result.worst_daily_drawdown >= 1100.0

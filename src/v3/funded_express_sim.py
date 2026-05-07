@@ -14,6 +14,7 @@ from typing import Any
 import pandas as pd
 
 from .config import DEFAULT_FUNDED_EXPRESS_SIM, FundedExpressSimRules
+from .futures_session import futures_session_date
 from .topstep import _group_trades_by_day
 from .trades import TradeResult
 
@@ -212,7 +213,7 @@ def _simulate_express_single_stint(
         worst_daily_dd_stint = max(worst_daily_dd_stint, daily_range_dd)
 
         if busted:
-            leftover = [t for t in remaining_input if t.exit_time.normalize() > termination_day]
+            leftover = [t for t in remaining_input if futures_session_date(t.exit_time) > termination_day]
             assert termination_day is not None
             return (
                 _StintOutcome(
@@ -328,6 +329,7 @@ def simulate_express_funded_resets(
             "survival_days": _survival_days(stint),
             "win_rate_pct": metrics.win_rate_pct,
             "avg_r_multiple": metrics.avg_r_multiple,
+            "sharpe_annualized": metrics.sharpe_annualized,
             "best_trade_pnl": metrics.best_trade_pnl,
             "worst_trade_pnl": metrics.worst_trade_pnl,
             "profit_factor": metrics.profit_factor,

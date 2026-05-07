@@ -9,7 +9,17 @@ from v3.strategies import STRATEGIES, StrategySpec
 
 def test_v3_config_exports_and_windows():
     assert WINDOWS.in_sample_sanity is None
+    assert len(WINDOWS.walk_forward) == 2
+    assert WINDOWS.walk_forward[0].train.start == "2021-03-19"
+    assert WINDOWS.walk_forward[0].train.end == "2023-02-28"
+    assert WINDOWS.walk_forward[0].test.start == "2023-03-01"
+    assert WINDOWS.walk_forward[0].test.end == "2023-11-30"
+    assert WINDOWS.walk_forward[1].train.start == "2021-03-19"
+    assert WINDOWS.walk_forward[1].train.end == "2023-11-30"
+    assert WINDOWS.walk_forward[1].test.start == "2023-12-01"
+    assert WINDOWS.walk_forward[1].test.end == "2024-08-31"
     assert WINDOWS.holdout.start == "2024-09-01"
+    assert WINDOWS.holdout.end == "2026-03-18"
     assert STRATEGY_NAMES == (
         "connors_rsi2",
         "ttm_squeeze",
@@ -19,6 +29,7 @@ def test_v3_config_exports_and_windows():
         "session_pivot_rejection",
         "session_pivot_break",
         "hl2_sma_retrace_atr",
+        "vp_dual_mode",
     )
     assert TOPSTEP_50K.account_size == 50_000.0
 

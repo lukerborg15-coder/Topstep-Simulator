@@ -15,6 +15,7 @@ from typing import Any
 import pandas as pd
 
 from .config import TOPSTEP_50K, TopStepRules
+from .futures_session import ensure_eastern_timestamp, futures_session_date
 from .topstep import TopStepResult, simulate_topstep
 from .trades import TradeResult
 
@@ -61,10 +62,10 @@ class CombineSimResult:
 def _group_trades_by_calendar_day(
     trades: list[TradeResult],
 ) -> list[list[TradeResult]]:
-    """Return trades grouped by calendar day (exit), sorted within each day by exit_time."""
+    """Return trades grouped by futures session day, sorted within each day by exit_time."""
     day_map: dict[pd.Timestamp, list[TradeResult]] = {}
     for trade in trades:
-        day = trade.exit_time.normalize()
+        day = futures_session_date(trade.exit_time)
         day_map.setdefault(day, []).append(trade)
     return [
         sorted(day_group, key=lambda t: t.exit_time)
@@ -84,10 +85,7 @@ def _flatten_day_groups_to_synthetic_timeline(day_groups: list[list[TradeResult]
         synthetic_date = epoch + pd.Timedelta(days=day_idx)
         for trade in day_group:
             original_time = trade.exit_time
-            if original_time.tzinfo is not None:
-                original_time_et = original_time.tz_convert("America/New_York")
-            else:
-                original_time_et = original_time.tz_localize("America/New_York")
+            original_time_et = ensure_eastern_timestamp(original_time)
             new_ts = synthetic_date.replace(
                 hour=original_time_et.hour,
                 minute=original_time_et.minute,

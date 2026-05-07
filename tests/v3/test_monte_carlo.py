@@ -8,6 +8,7 @@ import pytest
 
 from v3.monte_carlo import (
     MCResult,
+    _max_daily_loss,
     _dd_duration_trades,
     block_bootstrap_permute,
     mc_summary_dict,
@@ -167,3 +168,13 @@ def test_dd_duration_no_drawdown():
 
 def test_dd_duration_single_element():
     assert _dd_duration_trades([100.0]) == 0
+
+
+def test_max_daily_loss_uses_futures_session_grouping_for_overnight_trades():
+    trades = [
+        _trade(_ts(2, 18, 5), -600.0, r=-0.6),
+        _trade(_ts(3, 10, 0), -500.0, r=-0.5),
+        _trade(_ts(3, 18, 5), 100.0, r=0.1),
+    ]
+
+    assert _max_daily_loss(trades) == -1100.0

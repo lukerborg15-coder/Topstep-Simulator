@@ -167,6 +167,9 @@ def test_pipeline_verdict_rejects_when_robust_or_seq_gate_fails() -> None:
         holdout_net_pnl=100.0,
         holdout_max_drawdown=100.0,
         holdout_mc_pnl_p05=10.0,
+        wf1_trade_count=100,
+        wf2_trade_count=100,
+        holdout_trade_count=100,
     )
     assert r3.verdict == "COMBINE-READY"
     assert r3.wf_robust_ok is True
@@ -190,6 +193,9 @@ def test_verdict_summary_dict_has_correct_keys():
         "holdout_net_pnl",
         "holdout_max_drawdown",
         "holdout_mc_pnl_p05",
+        "wf1_trade_count",
+        "wf2_trade_count",
+        "holdout_trade_count",
     }
     assert set(summary) == expected_keys
     assert summary["strategy"] == result.strategy

@@ -25,6 +25,9 @@ class VerdictResult:
     holdout_net_pnl: float | None = None
     holdout_max_drawdown: float | None = None
     holdout_mc_pnl_p05: float | None = None
+    wf1_trade_count: int | None = None
+    wf2_trade_count: int | None = None
+    holdout_trade_count: int | None = None
 
 
 def _format_threshold(value: float) -> str:
@@ -99,6 +102,9 @@ def compute_pipeline_verdict(
     holdout_net_pnl: float,
     holdout_max_drawdown: float,
     holdout_mc_pnl_p05: float,
+    wf1_trade_count: int = 0,
+    wf2_trade_count: int = 0,
+    holdout_trade_count: int = 0,
 ) -> VerdictResult:
     """Staged pipeline: WF robustness, per-fold seq pass rate, sensitivity, holdout, MC."""
     reject_reasons: list[str] = []
@@ -115,6 +121,13 @@ def compute_pipeline_verdict(
         reject_reasons.append("holdout_total_net_pnl_negative")
     if holdout_mc_pnl_p05 < 0.0:
         reject_reasons.append("holdout_mc_pnl_p05_negative")
+    # B5: fold and holdout trade-count gates
+    if wf1_trade_count < 100:
+        reject_reasons.append("wf1_trade_count_below_100")
+    if wf2_trade_count < 100:
+        reject_reasons.append("wf2_trade_count_below_100")
+    if holdout_trade_count < 100:
+        reject_reasons.append("holdout_trade_count_below_100")
 
     if holdout_max_drawdown > 10_000_000.0:
         warn_reasons.append("holdout_max_drawdown_extremely_high")
@@ -140,6 +153,9 @@ def compute_pipeline_verdict(
         holdout_net_pnl=holdout_net_pnl,
         holdout_max_drawdown=holdout_max_drawdown,
         holdout_mc_pnl_p05=holdout_mc_pnl_p05,
+        wf1_trade_count=wf1_trade_count,
+        wf2_trade_count=wf2_trade_count,
+        holdout_trade_count=holdout_trade_count,
     )
 
 

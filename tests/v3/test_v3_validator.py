@@ -75,14 +75,21 @@ def test_missing_default_params_key_from_param_grid_rejects():
         validate_strategy_spec(spec)
 
 
-def test_grid_entries_with_fewer_than_three_values_reject():
-    spec = _valid_spec(
+def test_grid_entries_with_fewer_than_three_values_now_allowed():
+    # Single-element and two-element tuples are now valid (for fixed params in grid).
+    spec_two = _valid_spec(
         default_params={"risk_reward": 1.5},
-        param_grid={"risk_reward": (1.0, 1.5)},
+        param_grid={"risk_reward": (1.5,)},
     )
+    validate_strategy_spec(spec_two)  # must not raise
 
-    with pytest.raises(StrategyValidationError, match="at least 3 values"):
-        validate_strategy_spec(spec)
+    # Empty tuples are still rejected.
+    spec_empty = _valid_spec(
+        default_params={"risk_reward": 1.5},
+        param_grid={"risk_reward": ()},
+    )
+    with pytest.raises(StrategyValidationError, match="at least 1 value"):
+        validate_strategy_spec(spec_empty)
 
 
 def test_grid_entry_must_be_tuple():

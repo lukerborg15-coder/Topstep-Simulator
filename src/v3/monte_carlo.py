@@ -16,6 +16,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from .futures_session import futures_session_date
 from .trades import TradeResult
 
 
@@ -86,7 +87,7 @@ def _max_daily_loss(trades: list[TradeResult]) -> float:
         return 0.0
     daily: dict[Any, float] = {}
     for t in trades:
-        day = t.exit_time.normalize()
+        day = futures_session_date(t.exit_time)
         daily[day] = daily.get(day, 0.0) + t.net_pnl
     return min(daily.values()) if daily else 0.0
 

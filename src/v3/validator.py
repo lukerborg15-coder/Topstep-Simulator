@@ -8,7 +8,7 @@ import pandas as pd
 from .config import EASTERN_TZ
 
 
-ALLOWED_REQUIRES = {"pivot_levels"}
+ALLOWED_REQUIRES = {"pivot_levels", "volume_profile", "regime_classifier"}
 PIVOT_LEVEL_COLUMNS = (
     "camarilla_h4",
     "camarilla_s4",
@@ -93,11 +93,11 @@ def _validate_param_grid(default_params: dict[str, Any], param_grid: dict[str, A
     for key, values in param_grid.items():
         if not isinstance(values, tuple):
             raise StrategyValidationError(f"param_grid entry {key!r} must be a tuple")
-        if len(values) < 3:
-            raise StrategyValidationError(f"param_grid entry {key!r} must contain at least 3 values")
-        if default_params[key] not in values:
+        if len(values) < 1:
+            raise StrategyValidationError(f"param_grid entry {key!r} must contain at least 1 value")
+        if len(values) > 1 and default_params[key] not in values:
             raise StrategyValidationError(f"default value for {key!r} must be included in its param_grid tuple")
-        if _is_numeric_grid(values) and list(values) != sorted(values):
+        if _is_numeric_grid(values) and len(values) > 1 and list(values) != sorted(values):
             raise StrategyValidationError(f"numeric param_grid entry {key!r} must be ordered smallest to largest")
 
 
@@ -159,6 +159,10 @@ def _synthetic_ohlcv(session_start: str, session_end: str, requires: tuple[str, 
     )
     if "pivot_levels" in requires:
         _add_synthetic_pivot_levels(df)
+    if "volume_profile" in requires:
+        _add_synthetic_volume_profile_levels(df)
+    if "regime_classifier" in requires:
+        df["day_regime"] = "balance"
     return df
 
 
@@ -171,6 +175,18 @@ def _session_index(session_start: str, session_end: str, bars: int) -> pd.Dateti
         ranges.append(pd.date_range(start=start, end=end, freq="5min"))
         day += pd.Timedelta(days=1)
     return ranges[0].append(ranges[1:])[:bars]
+
+
+def _add_synthetic_volume_profile_levels(df: pd.DataFrame) -> None:
+    close = df["close"]
+    df["pdVAH"] = close + 2.0
+    df["pdVAL"] = close - 2.0
+    df["pdVPOC"] = close + 0.5
+    df["naked_pocs"] = [[] for _ in range(len(df))]
+    df["dist_to_pdVAH_atr"] = 0.5
+    df["dist_to_pdVAL_atr"] = 0.5
+    df["dist_to_pdVPOC_atr"] = 0.5
+    df["dist_to_nearest_naked_poc_atr"] = np.nan
 
 
 def _add_synthetic_pivot_levels(df: pd.DataFrame) -> None:

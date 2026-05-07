@@ -46,13 +46,20 @@ pip install -e .
 
 ## Data Setup
 
-Place MNQ OHLCV CSVs in `Data/` (project root). Expected naming convention:
+Place Databento-derived OHLCV CSVs in `Data/` (project root). Expected naming convention:
 
 ```
-Data/MNQ_5min.csv
-Data/MNQ_1min.csv
-Data/MNQ_15min.csv
+Data/mnq_1min_databento.csv
+Data/mnq_5min_databento.csv
+Data/mes_1min_databento.csv
 ```
+
+The loader and builder use lowercase instrument ids (`mnq`, `mes`) and the
+`{instrument}_{timeframe}_databento.csv` naming scheme.
+
+Related docs:
+
+- `docs/data/session_resampling.md` documents the session-aware resampling contract shared by the loader and data builder.
 
 Override via environment variable:
 
@@ -62,6 +69,9 @@ Override via environment variable:
 | `TOPSTEP_PIPELINE_OUTPUT_DIR` | Result JSON / artifacts (default: `<repo>/output`) |
 
 Or at runtime: `--data-dir /path/to/data`
+
+Large market data is intentionally kept out of git. Keep `Data/` local or in
+external storage; publish code, docs, and lightweight configuration only.
 
 ---
 
@@ -132,6 +142,7 @@ topstep-pipeline --strategy hl2_sma_retrace_atr --mode holdout-only
 | Flag | Default | Description |
 |---|---|---|
 | `--strategy` | required | Strategy key |
+| `--instrument` | `mnq` | `mnq` or `mes` |
 | `--mode` | `quick` | `quick`, `full`, or `holdout-only` |
 | `--timeframe` | `5min` | Bar timeframe (matches CSV filename) |
 | `--eval-risk` | `500` | Dollars risked per trade before contract cap |
@@ -149,7 +160,7 @@ topstep-pipeline --strategy hl2_sma_retrace_atr --mode holdout-only
 | `--compare-fixed-risk` | unset | Compare optimizer vs a fixed $/trade |
 | `--compare-fixed-contracts` | unset | Compare optimizer vs a fixed contract count |
 | `--output-dir` | `output/` | Root for JSON, summaries, frozen params |
-| `--data-dir` | `Data/` | Directory containing MNQ CSV bundles |
+| `--data-dir` | `Data/` | Directory containing `{instrument}_{timeframe}_databento.csv` files |
 | `--topstep-weight` | `1.0` | Walk-forward scoring weight for topstep_score |
 | `--avg-r-weight` | `25.0` | Walk-forward scoring weight for avg_r |
 
@@ -161,29 +172,30 @@ topstep-pipeline --strategy hl2_sma_retrace_atr --mode holdout-only
 
 ## Contract / Sizing Optimizers
 
-Two post-evaluation stages in `position_sizing.py`. Both grid-search over risk levels (default `[$50, $75, $100, $150, $200, $300, $400, $500]`), resize all trades at each level, and rank candidates on a robust objective. Results saved to JSON in `output/`.
+Two post-evaluation stages in `position_sizing.py`. Both grid-search over risk levels (default `$50` to `$950` in `$50` increments), resize all trades at each level, and rank candidates on a robust objective. Coverage filtering still rejects risk levels that cannot produce enough trades with at least one contract. Results saved to JSON in `output/`.
 
 ### Speed Optimizer (`--optimize-sizing-for-speed`)
 
 **Goal:** find the risk-per-trade that gets you through the Topstep Combine fastest with a high pass rate. Soft target is **≤ 10 days to pass**.
 
-**Method (V2 — train-fit, OOS-evaluate, aggregate):**
+**Method (V2 — train-fit, OOS-evaluate, aggregate, adaptive floor):**
 1. For each WF fold, optimize on the **training** trades only (no OOS peeking).
 2. Cap each evaluation chain at `--speed-attempt-budget` (default 10) — pass rate is `passes / min(N, attempts)`, comparable across risk levels.
 3. Filter risks via coverage threshold: each risk must produce ≥ 1 contract on ≥ `--risk-coverage-threshold` (default 50%) of trades.
 4. Compute median, mean, IQR, p90, std (ddof=1) of `days_to_pass`.
-5. Rank candidates by **utility = pass_rate × exp(-max(0, median_days − target) / 5)** with target = `--speed-target-days` (default 10). Soft penalty past 10 days.
-6. Evaluate the train-winner on the OOS fold to record honest test performance.
-7. Aggregate across folds: keep risks viable in ≥ ⌈N/2⌉ folds; rank by **median OOS utility**, tiebreak by **worst-fold utility**.
+5. **Adaptive pass-rate floor:** `--pass-floor-pct` now acts as a CEILING. Per fold, compute `effective_floor = min(user_floor, max(20.0, best_train_pass_rate × 0.7))`. If best train pass rate is low (e.g. 35%), floor relaxes to 24.5% so candidates aren't all rejected. Hard minimum of 20% prevents runaway. Reported in output as `effective_pass_floor_pct` and `adaptive_floor_applied`.
+6. Rank candidates by **utility = pass_rate × exp(-max(0, median_days − target) / 5)** with target = `--speed-target-days` (default 10). Soft penalty past 10 days.
+7. Evaluate the train-winner on the OOS fold to record honest test performance.
+8. Aggregate across folds: in the default two-fold setup, keep only risks viable in both folds (explicit `min_viable_folds` overrides still apply); rank by **median OOS utility**, tiebreak by **worst-fold utility**.
 
-**Output:** `output/<strategy>_wf_speed_optimization_aggregate.json` (the deliverable). Per-fold diagnostics still written as `output/<strategy>_wf<N>_speed_optimization_diagnostic.json`.
+**Output:** `output/json/<strategy>_wf_speed_optimization_aggregate.json` (the deliverable). Aggregate `effective_pass_floor_pct` is the median of per-fold effective floors; `adaptive_floor_applied` is True if any fold triggered the relaxation.
 
 | Flag | Default | Description |
 |---|---|---|
 | `--optimize-sizing-for-speed` | off | Enable speed optimizer |
 | `--speed-attempt-budget` | `10` | Max sequential eval attempts per fold/risk |
 | `--speed-target-days` | `10.0` | Soft ceiling for days-to-pass; utility decays past this |
-| `--pass-floor-pct` | `40.0` | Min train pass rate % to qualify as viable |
+| `--pass-floor-pct` | `40.0` | Pass rate ceiling — adaptive floor relaxes if train pass rates are low (min 20%) |
 | `--risk-coverage-threshold` | `0.5` | Min fraction of trades that must produce ≥ 1 contract |
 
 ### Longevity Optimizer (`--optimize-sizing-for-longevity`)
@@ -253,10 +265,10 @@ The text summary (`output/txt summaries/<strategy>_<tf>_result_summary.txt`) put
 
 | Window | Start | End |
 |---|---|---|
-| WF1 train | 2022-09-01 | 2023-08-31 |
-| WF1 test | 2023-09-01 | 2024-02-29 |
-| WF2 train | 2022-09-01 | 2024-02-29 |
-| WF2 test | 2024-03-01 | 2024-08-31 |
+| WF1 train | 2021-03-19 | 2023-02-28 |
+| WF1 test | 2023-03-01 | 2023-11-30 |
+| WF2 train | 2021-03-19 | 2023-11-30 |
+| WF2 test | 2023-12-01 | 2024-08-31 |
 | Holdout | 2024-09-01 | 2026-03-18 |
 
 Override with `--pipeline-config config/your_windows.json`. See `config/README.md` for JSON schema.
@@ -287,11 +299,16 @@ All thresholds are overridable via `--reject-*` / `--ready-*` CLI flags.
 
 ```
 output/
-  json/            <strategy>_<timeframe>_result.json    — full result bundle
-  txt summaries/   <strategy>_<timeframe>_result_summary.txt
+  json/            <strategy>_<timeframe>_result.json              — full result bundle
+                   <strategy>_wf_speed_optimization_aggregate.json — speed optimizer output
+                   <strategy>_holdout_longevity_optimization_mc.json — longevity optimizer output
+                   <strategy>_sizing_comparison.json               — sizing comparison output
+  txt summaries/   <strategy>_<timeframe>_result_summary.txt       — human-readable pipeline report
   graphs/          MC path plots, sensitivity heatmaps (.png)
   frozen_params/   SHA-256 hashed param files + audit_log.jsonl
 ```
+
+**Re-run behavior:** files are named by `<strategy>_<timeframe>` and overwrite on re-run with same args. To preserve runs, pass a unique `--output-dir`.
 
 ---
 
@@ -349,7 +366,7 @@ python -m pytest tests/v3/ -q
 | `src/v3/user_strategies/` | Drop-in user strategy files (auto-loaded) |
 | `tests/` | Pytest suite |
 | `config/` | Optional JSON date windows (`--pipeline-config`) |
-| `scripts/` | Standalone utilities (e.g. result JSON summarizer) |
+| `scripts/` | Standalone utilities (stable entrypoints at top level, probes under `diagnostics/`, data helpers under `data/`) |
 | `run-cli.cmd` | Windows launcher (sets PYTHONPATH to this repo's src/) |
 | `pyproject.toml` | Build config and dependencies |
 
@@ -384,3 +401,51 @@ python -m pytest tests/v3/ -q
 | `audit_stamp.py` | Audit JSON + JSONL append log |
 | `json_readable.py` | Result JSON → human-readable text export |
 | `user_strategies/hl2_sma_retrace_atr.py` | HL2 SMA retrace + ATR stop/target user strategy |
+
+---
+
+## Data Builder (`scripts/build_data.py`)
+
+Utility for building normalized OHLCV CSV artifacts from raw Databento exports.
+
+**Usage:**
+
+```bash
+# Resample existing 1min to higher timeframes
+python scripts/build_data.py --instrument mnq --timeframes 5min 15min
+
+# Normalize raw Databento source to 1min
+python scripts/build_data.py --instrument mes --timeframes 1min --source C:\path\to\source.zip
+
+# Full pipeline: normalize + generate higher timeframes
+python scripts/build_data.py --instrument mes --timeframes 5min 15min 1h --source C:\path\to\source.zip
+```
+
+**Arguments:**
+
+| Argument | Description |
+|---|---|
+| `--instrument` | `mnq` or `mes` |
+| `--timeframes` | Target timeframes (default: `1min`). Supports: `1min`, `2min`, `3min`, `5min`, `15min`, `30min`, `1h`, `4h` |
+| `--source` | Path to raw Databento ZIP or CSV (must contain `ts_event`, `open`, `high`, `low`, `close`, `volume`, `symbol`) |
+| `--output-dir` | Output directory (default: `Data/`) |
+
+**Output format:** `Data/{instrument}_{timeframe}_databento.csv`
+
+Columns: `datetime,open,high,low,close,volume`  
+Datetime format: `2021-03-18 20:00:00-04:00` (Eastern timezone with colon in offset)
+
+**Schema normalization:** Raw Databento timestamps (UTC) are converted to America/New_York timezone.
+
+**Continuous contract rule:** The builder only accepts strict outright symbols (`MES`/`MNQ` + month code + year digit), explicitly rejects spreads such as `MESM4-MESU4`, and creates a monotonic continuous series by holding the current contract until a later expiry beats it on total daily volume. This prevents spread contamination and avoids rolling backward into older expiries.
+
+## Diagnostics Scripts
+
+Local probes that are useful during data/runtime investigations now live under `scripts/diagnostics/` so the main repo entrypoints stay easy to scan.
+
+- `scripts/diagnostics/audit_regimes.py`
+- `scripts/diagnostics/test_mes_load.py`
+- `scripts/diagnostics/vp_sanity_check.py`
+- `scripts/diagnostics/analyze_mes_coverage.py`
+
+Data-specific helper wrappers that complement the main builder live under `scripts/data/`.

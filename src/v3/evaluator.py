@@ -12,7 +12,6 @@ from .config import (
     DEFAULT_RISK_DOLLARS,
     MNQ,
     SCORING_WEIGHTS,
-    SESSION_END,
     TOPSTEP_50K,
     DateWindow,
     Instrument,
@@ -68,7 +67,6 @@ def simulate_trades(
     if frame.empty or not signals:
         return []
 
-    session_end_time = pd.Timestamp(SESSION_END).time()
     trades: list[TradeResult] = []
     for signal in sorted(signals, key=lambda item: item.time):
         if signal.time not in frame.index:
@@ -106,11 +104,6 @@ def simulate_trades(
                 exit_price = signal.target
                 exit_time = ts
                 exit_reason = "target"
-                break
-            if ts.time() >= session_end_time:
-                exit_price = float(row["close"])
-                exit_time = ts
-                exit_reason = "session_end"
                 break
         else:
             exit_price = float(frame["close"].iloc[-1])
@@ -231,18 +224,62 @@ def evaluate_strategy(
     params: dict[str, Any],
     window: DateWindow,
     *,
+    instrument: Instrument = MNQ,
     risk_dollars: float = DEFAULT_RISK_DOLLARS,
     max_contracts: int | None = None,
+    raw_frame: pd.DataFrame | None = None,
+    attached_frame: pd.DataFrame | None = None,
 ) -> EvaluationResult:
+    """Evaluate a strategy over a date window.
+
+    Parameters
+    ----------
+    frame:
+        Execution frame (used for slicing the evaluation window and trade simulation).
+        Typically 5-min RTH bars.
+    raw_frame:
+        Optional higher-resolution frame (e.g. 1-min bars, full session) used for
+        VP and regime attachment. When None, ``frame`` is used for both purposes
+        (preserves backward compatibility with callers that only have one frame).
+    attached_frame:
+        Optional pre-attached frame (VP + regime columns already computed and sliced
+        to ``window``).  When provided, skips all attachment steps.  Used by
+        ``run_walk_forward`` to avoid recomputing VP/regime for every param candidate
+        (B4 memoization).
+    """
     sliced = slice_window(frame, window)
     spec = STRATEGIES[strategy_name]
     active_params = dict(spec.default_params)
     active_params.update(params)
-    signal_frame = sliced
-    if "pivot_levels" in spec.requires:
-        signal_frame = attach_pivot_levels(sliced, raw_frame=frame)
+
+    if attached_frame is not None:
+        signal_frame = attached_frame
+    else:
+        signal_frame = sliced
+        indicator_frame = raw_frame if raw_frame is not None else frame
+        if "pivot_levels" in spec.requires:
+            signal_frame = attach_pivot_levels(sliced, raw_frame=indicator_frame)
+        if "volume_profile" in spec.requires:
+            from .volume_profile import attach_volume_profile
+            signal_frame = attach_volume_profile(
+                signal_frame,
+                indicator_frame,
+                vp_rows=int(active_params.get("vp_rows", 400)),
+                va_pct=float(active_params.get("va_pct", 0.70)),
+                lookback_sessions=int(active_params.get("naked_poc_lookback_sessions", 3)),
+                session_mode=str(active_params.get("vp_session_mode", "full")),
+            )
+        if "regime_classifier" in spec.requires:
+            from .regime_classifier import attach_day_regimes
+            signal_frame = attach_day_regimes(
+                signal_frame,
+                indicator_frame,
+                de_threshold=float(active_params.get("de_threshold", 0.35)),
+                de_lookback=int(active_params.get("de_lookback", 20)),
+            )
+
     signals = spec.generate(signal_frame, active_params)
-    trades = simulate_trades(sliced, signals, risk_dollars=risk_dollars, max_contracts=max_contracts)
+    trades = simulate_trades(sliced, signals, instrument=instrument, risk_dollars=risk_dollars, max_contracts=max_contracts)
     metrics = compute_metrics(trades)
     topstep = topstep_summary_dict(simulate_topstep(trades))
     return EvaluationResult(
@@ -264,7 +301,66 @@ def attach_sequential_topstep_oos(result: EvaluationResult) -> None:
     td["seq_eval_attempts"] = len(seq_log)
     attempts = int(len(seq_log))
     td["seq_eval_pass_rate"] = float(seq_passes) / float(attempts) if attempts > 0 else 0.0
+    passed_days = [
+        int(attempt.days_to_pass)
+        for attempt in seq_log
+        if attempt.passed and attempt.days_to_pass is not None
+    ]
+    if passed_days:
+        arr = np.array(passed_days, dtype=float)
+        td["seq_eval_median_days_to_pass"] = float(np.median(arr))
+        td["seq_eval_mean_days_to_pass"] = float(arr.mean())
+        td["seq_eval_min_days_to_pass"] = int(arr.min())
+        td["seq_eval_max_days_to_pass"] = int(arr.max())
+        td["seq_eval_first_pass_days_to_pass"] = int(passed_days[0])
+    else:
+        td["seq_eval_median_days_to_pass"] = None
+        td["seq_eval_mean_days_to_pass"] = None
+        td["seq_eval_min_days_to_pass"] = None
+        td["seq_eval_max_days_to_pass"] = None
+        td["seq_eval_first_pass_days_to_pass"] = None
     result.topstep = td
+
+
+def _vp_regime_cache_key(params: dict[str, Any]) -> tuple:
+    """Key for VP+regime attachment cache — only the params that affect attachment."""
+    return (
+        str(params.get("vp_session_mode", "full")),
+        int(params.get("naked_poc_lookback_sessions", 3)),
+        int(params.get("vp_rows", 400)),
+        float(params.get("va_pct", 0.70)),
+        float(params.get("de_threshold", 0.35)),
+        int(params.get("de_lookback", 20)),
+    )
+
+
+def _build_attached_frame(
+    base_frame: pd.DataFrame,
+    indicator_frame: pd.DataFrame,
+    params: dict[str, Any],
+    spec,
+) -> pd.DataFrame:
+    """Attach VP and/or regime columns to base_frame using params."""
+    result = base_frame
+    if "volume_profile" in spec.requires:
+        from .volume_profile import attach_volume_profile
+        result = attach_volume_profile(
+            result,
+            indicator_frame,
+            vp_rows=int(params.get("vp_rows", 400)),
+            va_pct=float(params.get("va_pct", 0.70)),
+            lookback_sessions=int(params.get("naked_poc_lookback_sessions", 3)),
+            session_mode=str(params.get("vp_session_mode", "full")),
+        )
+    if "regime_classifier" in spec.requires:
+        from .regime_classifier import attach_day_regimes
+        result = attach_day_regimes(
+            result,
+            indicator_frame,
+            de_threshold=float(params.get("de_threshold", 0.35)),
+            de_lookback=int(params.get("de_lookback", 20)),
+        )
+    return result
 
 
 def run_walk_forward(
@@ -276,8 +372,10 @@ def run_walk_forward(
     min_folds_meeting_passes: int | None = None,
     windows: PipelineWindows | None = None,
     *,
+    instrument: Instrument = MNQ,
     risk_dollars: float = DEFAULT_RISK_DOLLARS,
     max_contracts: int | None = None,
+    raw_frame: pd.DataFrame | None = None,
 ) -> tuple[dict[str, Any], list[EvaluationResult], bool]:
     spec = STRATEGIES[strategy_name]
     candidates = spec.grid()
@@ -307,20 +405,53 @@ def run_walk_forward(
     if min_folds_meeting_passes < 1:
         raise ValueError("min_folds_meeting_passes must be at least 1")
 
+    needs_attachment = (
+        "volume_profile" in spec.requires or "regime_classifier" in spec.requires
+    )
+    indicator_frame = raw_frame if raw_frame is not None else frame
+
     selected_params: list[dict[str, Any]] = []
     oos_folds: list[EvaluationResult] = []
     train_best_results: list[EvaluationResult] = []
 
     for wf in wf_list:
+        # B4: Pre-compute VP+regime once per unique parameter combination rather
+        # than once per candidate (was 5,103 redundant calls per fold).
+        train_cache: dict[tuple, pd.DataFrame] = {}
+        if needs_attachment:
+            train_base = slice_window(frame, wf.train)
+            seen_keys: set[tuple] = set()
+            for p in candidates:
+                key = _vp_regime_cache_key(p)
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                train_cache[key] = _build_attached_frame(train_base, indicator_frame, p, spec)
+
         train_results = [
-            evaluate_strategy(frame, strategy_name, timeframe, params, wf.train, risk_dollars=risk_dollars, max_contracts=max_contracts)
+            evaluate_strategy(
+                frame, strategy_name, timeframe, params, wf.train,
+                instrument=instrument,
+                risk_dollars=risk_dollars, max_contracts=max_contracts, raw_frame=raw_frame,
+                attached_frame=train_cache.get(_vp_regime_cache_key(params)) if needs_attachment else None,
+            )
             for params in candidates
         ]
         train_best = max(train_results, key=_score_result)
         train_best_results.append(train_best)
         selected_params.append(train_best.params)
+
+        # OOS attachment — one computation for the selected params on the test window.
+        oos_attached: pd.DataFrame | None = None
+        if needs_attachment:
+            oos_base = slice_window(frame, wf.test)
+            oos_attached = _build_attached_frame(oos_base, indicator_frame, train_best.params, spec)
+
         oos = evaluate_strategy(
-            frame, strategy_name, timeframe, train_best.params, wf.test, risk_dollars=risk_dollars, max_contracts=max_contracts
+            frame, strategy_name, timeframe, train_best.params, wf.test,
+            instrument=instrument,
+            risk_dollars=risk_dollars, max_contracts=max_contracts, raw_frame=raw_frame,
+            attached_frame=oos_attached,
         )
         attach_sequential_topstep_oos(oos)
         oos_folds.append(oos)
@@ -358,8 +489,10 @@ def wf_oos_folds_for_selected_params(
     selected_params: dict[str, Any],
     windows: PipelineWindows,
     *,
+    instrument: Instrument = MNQ,
     risk_dollars: float = DEFAULT_RISK_DOLLARS,
     max_contracts: int | None = None,
+    raw_frame: pd.DataFrame | None = None,
 ) -> list[EvaluationResult]:
     out: list[EvaluationResult] = []
     for wf in windows.walk_forward:
@@ -369,8 +502,10 @@ def wf_oos_folds_for_selected_params(
             timeframe,
             selected_params,
             wf.test,
+            instrument=instrument,
             risk_dollars=risk_dollars,
             max_contracts=max_contracts,
+            raw_frame=raw_frame,
         )
         attach_sequential_topstep_oos(oos)
         out.append(oos)
@@ -384,8 +519,10 @@ def wf_train_test_trades_for_selected_params(
     selected_params: dict[str, Any],
     windows: PipelineWindows,
     *,
+    instrument: Instrument = MNQ,
     risk_dollars: float = DEFAULT_RISK_DOLLARS,
     max_contracts: int | None = None,
+    raw_frame: pd.DataFrame | None = None,
 ) -> list[tuple[list[TradeResult], list[TradeResult]]]:
     """Extract (train_trades, test_trades) tuples for each WF fold.
 
@@ -400,8 +537,10 @@ def wf_train_test_trades_for_selected_params(
             timeframe,
             selected_params,
             wf.train,
+            instrument=instrument,
             risk_dollars=risk_dollars,
             max_contracts=max_contracts,
+            raw_frame=raw_frame,
         )
         test = evaluate_strategy(
             frame,
@@ -409,8 +548,10 @@ def wf_train_test_trades_for_selected_params(
             timeframe,
             selected_params,
             wf.test,
+            instrument=instrument,
             risk_dollars=risk_dollars,
             max_contracts=max_contracts,
+            raw_frame=raw_frame,
         )
         out.append((train.trades, test.trades))
     return out
@@ -439,11 +580,14 @@ def aggregate_wf_metrics(folds: list[EvaluationResult]) -> dict[str, Any]:
             "wf_avg_net_pnl": 0.0,
             "wf_oos_total_pnl": 0.0,
             "wf_consistency": 0.0,
+            "wf_avg_sharpe": 0.0,
+            "wf_sharpe_by_fold": [],
             "wf_seq_eval_passes_by_fold": [],
             "wf_fold_seq_pass_rates": [],
         }
 
     net_pnls = [float(fold.metrics.get("total_net_pnl", 0.0)) for fold in folds]
+    sharpes = [float(fold.metrics.get("sharpe", 0.0)) for fold in folds]
     scores = [_score_result(fold) for fold in folds]
     seq_by_fold = [int(fold.topstep.get("seq_eval_passes", 0)) for fold in folds]
     rates = [fold_seq_eval_pass_rate(fold.topstep) for fold in folds]
@@ -454,6 +598,8 @@ def aggregate_wf_metrics(folds: list[EvaluationResult]) -> dict[str, Any]:
         "wf_avg_net_pnl": float(np.mean(net_pnls)),
         "wf_oos_total_pnl": float(sum(net_pnls)),
         "wf_consistency": float(np.std(net_pnls, ddof=1)) if len(net_pnls) > 1 else 0.0,
+        "wf_avg_sharpe": float(np.mean(sharpes)),
+        "wf_sharpe_by_fold": sharpes,
         "wf_seq_eval_passes_by_fold": seq_by_fold,
         "wf_fold_seq_pass_rates": rates,
     }
@@ -562,3 +708,18 @@ __all__ = [
     "walk_forward_development_window",
     "wf_oos_folds_for_selected_params",
 ]
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

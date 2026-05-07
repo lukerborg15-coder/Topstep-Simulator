@@ -21,6 +21,7 @@ from .config import (
     DEFAULT_MIN_FOLD_SEQ_PASS_RATE_PCT,
     DEFAULT_RISK_DOLLARS,
     DEFAULT_STRICT_WF_GATE,
+    INSTRUMENTS,
     OUTPUT_DIR,
     ScoringWeights,
     VERDICT_THRESHOLDS,
@@ -48,6 +49,7 @@ from .json_readable import write_readable_text_from_json_file
 from .monte_carlo import MCResult, mc_summary_dict, mc_summary_text, plot_mc_paths, run_mc
 from .pipeline_config import resolve_windows
 from .position_sizing import (
+    DEFAULT_RISK_GRID,
     LongevityOptimizationMCResult,
     LongevityOptimizationResult,
     SpeedOptimizationAggregateResult,
@@ -74,16 +76,22 @@ from .verdict import compute_pipeline_verdict, verdict_summary_dict
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Topstep evaluation pipeline (validate → WF → sensitivity → holdout → MC → regime → verdict)."
+        description="Topstep evaluation pipeline (validate -> WF -> sensitivity -> holdout -> MC -> regime -> verdict)."
     )
     parser.add_argument("--strategy", default=None, help="Registered strategy key (required unless --list-strategies).")
+    parser.add_argument(
+        "--instrument",
+        choices=list(INSTRUMENTS.keys()),
+        default="mnq",
+        help="Trading instrument: mnq (Micro E-mini Nasdaq) or mes (Micro E-mini S&P). Default: mnq",
+    )
     parser.add_argument(
         "--mode",
         choices=["quick", "full", "holdout-only"],
         default="quick",
         help=(
-            "Pipeline mode: quick: stages 1→2 then 4→7 (skip stage 3 parameter sensitivity). "
-            "full: all stages 1→7 including sensitivity. holdout-only: 1→2 then 4→7 "
+            "Pipeline mode: quick: stages 1->2 then 4->7 (skip stage 3 parameter sensitivity). "
+            "full: all stages 1->7 including sensitivity. holdout-only: 1->2 then 4->7 "
             "(frozen/default params; skips walk-forward and sensitivity)."
         ),
     )
@@ -112,8 +120,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mc-ci-pct", type=float, default=DEFAULT_MC_CI_PCT, help=f"Confidence interval percentage for MC (default {DEFAULT_MC_CI_PCT}).")
     parser.add_argument("--topstep-weight", type=float, default=1.0, help="Weight for Topstep score in walk-forward selection (default 1.0)")
     parser.add_argument("--avg-r-weight", type=float, default=25.0, help="Weight for avg_r in walk-forward selection (default 25.0)")
-    parser.add_argument("--data-dir", default=str(DEFAULT_DATA_DIR), help="Directory containing MNQ_* CSV bundles.")
-    parser.add_argument("--output-dir", default=str(OUTPUT_DIR), help="Run output root (JSON→json/, text summaries→txt summaries/, frozen→frozen_params/).")
+    parser.add_argument(
+        "--data-dir",
+        default=str(DEFAULT_DATA_DIR),
+        help="Directory containing {instrument}_{timeframe}_databento.csv files.",
+    )
+    parser.add_argument("--output-dir", default=str(OUTPUT_DIR), help="Run output root (JSON->json/, text summaries->txt summaries/, frozen->frozen_params/).")
     parser.add_argument("--frozen-params-dir", default=None, help="Overrides output-dir/frozen_params as the freeze and audit stamp directory.")
     parser.add_argument("--list-strategies", action="store_true", help="List registered strategies and exit.")
     parser.add_argument("--skip-wf", action="store_true", help="Skip walk-forward optimization; evaluate holdout using default_params.")
@@ -306,6 +318,13 @@ def _print_speed_optimization_aggregate(result: SpeedOptimizationAggregateResult
     print(f"Median OOS Pass Rate: {result.median_oos_pass_rate_pct:.1f}%")
     print(f"Median OOS Median Days: {result.median_oos_median_days_to_pass:.1f} days")
     print(f"Viable in {result.viable_folds}/{result.n_folds} folds")
+    if result.adaptive_floor_applied:
+        print(
+            f"Pass floor (effective/user): {result.effective_pass_floor_pct:.1f}% / "
+            f"{result.pass_floor_pct:.1f}% (adaptive applied)"
+        )
+    else:
+        print(f"Pass floor: {result.effective_pass_floor_pct:.1f}%")
     print()
     print("Top 5 alternatives:")
     if not result.candidates:
@@ -365,16 +384,29 @@ def _print_longevity_optimization_mc(result: LongevityOptimizationMCResult) -> N
         print("(no candidates)")
         return
     for idx, candidate in enumerate(result.candidates[:5], 1):
-        print(
-            f"{idx}. {_money(float(candidate['risk_dollars']))}  "
-            f"med_long={float(candidate['median_longevity_score']):.4f}  "
-            f"p05_long={float(candidate['p05_longevity_score']):.4f}"
-        )
+        if candidate.get("rejected"):
+            print(
+                f"{idx}. {_money(float(candidate['risk_dollars']))}  "
+                f"REJECTED — {candidate.get('reject_reason', 'unknown')}"
+            )
+        else:
+            print(
+                f"{idx}. {_money(float(candidate['risk_dollars']))}  "
+                f"med_long={float(candidate['median_longevity_score']):.4f}  "
+                f"p05_long={float(candidate['p05_longevity_score']):.4f}"
+            )
 
 
 def _resolve_frozen_dir(output_dir: Path, frozen_explicit: Path | None) -> Path:
     default = Path(output_dir) / "frozen_params"
     return default if frozen_explicit is None else Path(frozen_explicit)
+
+
+def _requires_raw_frame(spec) -> bool:
+    return (
+        "volume_profile" in spec.requires
+        or "regime_classifier" in spec.requires
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -439,10 +471,14 @@ def main(argv: list[str] | None = None) -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
     graphs_dir = output_dir / "graphs"
     graphs_dir.mkdir(parents=True, exist_ok=True)
+    json_dir = output_dir / "json"
+    json_dir.mkdir(parents=True, exist_ok=True)
     frozen_explicit = Path(args.frozen_params_dir).resolve() if args.frozen_params_dir else None
     frozen_root = _resolve_frozen_dir(output_dir, frozen_explicit)
 
     spec = STRATEGIES[strategy_key]
+    instrument_key = args.instrument
+    instrument_obj = INSTRUMENTS[instrument_key]
 
     _print_stage_header("Stage 1 — Validate")
     try:
@@ -453,7 +489,10 @@ def main(argv: list[str] | None = None) -> int:
     print("OK — strategy specification passed Level B validation.")
 
     data_dir_path = Path(args.data_dir)
-    frame = load_ohlcv(instrument="mnq", timeframe=args.timeframe, data_dir=data_dir_path, session_only=True)
+    frame = load_ohlcv(instrument=instrument_key, timeframe=args.timeframe, data_dir=data_dir_path, session_only=False)
+    raw_1min = None
+    if _requires_raw_frame(spec):
+        raw_1min = load_ohlcv(instrument=instrument_key, timeframe="1min", data_dir=data_dir_path, session_only=False)
     pipeline_windows = resolve_windows(args.pipeline_config)
     eval_risk = float(args.eval_risk_dollars)
     max_contracts = int(args.max_contracts)
@@ -493,8 +532,10 @@ def main(argv: list[str] | None = None) -> int:
             min_eval_passes_per_fold=args.min_eval_passes_per_fold,
             min_folds_meeting_passes=args.min_wf_passes,
             windows=pipeline_windows,
+            instrument=instrument_obj,
             risk_dollars=eval_risk,
             max_contracts=max_contracts,
+            raw_frame=raw_1min,
         )
         wf_oos_final = wf_oos_folds_for_selected_params(
             frame,
@@ -502,8 +543,10 @@ def main(argv: list[str] | None = None) -> int:
             args.timeframe,
             selected_params,
             pipeline_windows,
+            instrument=instrument_obj,
             risk_dollars=eval_risk,
             max_contracts=max_contracts,
+            raw_frame=raw_1min,
         )
         wf_all_folds_seq_ok, fold_rates = all_folds_meet_min_seq_pass_rate(
             wf_oos_final, args.min_fold_seq_pass_rate_pct
@@ -521,8 +564,10 @@ def main(argv: list[str] | None = None) -> int:
                 args.timeframe,
                 selected_params,
                 pipeline_windows,
+                instrument=instrument_obj,
                 risk_dollars=eval_risk,
                 max_contracts=max_contracts,
+                raw_frame=raw_1min,
             )
 
         for fold_idx, fold in enumerate(wf_oos_final, 1):
@@ -543,13 +588,14 @@ def main(argv: list[str] | None = None) -> int:
             speed_optimization_aggregate_result = optimize_speed_wf_aggregate(
                 fold_trade_pairs,
                 strategy=strategy_key,
-                risk_levels=[50.0, 75.0, 100.0, 150.0, 200.0, 300.0, 400.0, 500.0],
+                risk_levels=list(DEFAULT_RISK_GRID),
                 pass_floor_pct=args.pass_floor_pct,
                 speed_target_days=args.speed_target_days,
                 attempt_budget=args.speed_attempt_budget,
                 coverage_threshold=args.risk_coverage_threshold,
+                instrument=instrument_obj,
             )
-            speed_path = output_dir / f"{strategy_key}_wf_speed_optimization_aggregate.json"
+            speed_path = json_dir / f"{strategy_key}_wf_speed_optimization_aggregate.json"
             _write_optimization_json(speed_path, speed_optimization_aggregate_result)
             speed_optimization_paths.append(str(speed_path.resolve()))
             _print_speed_optimization_aggregate(speed_optimization_aggregate_result)
@@ -558,7 +604,7 @@ def main(argv: list[str] | None = None) -> int:
         wf_folds_serial = [_eval_json(f) for f in wf_oos_final]
         print("WF aggregate:", ", ".join(f"{k}={v}" for k, v in wf_aggregate.items()))
         print("best_params(selected):", json.dumps(selected_params, sort_keys=True, default=str))
-        print(f"WF development window: {wf_dev_window.start} → {wf_dev_window.end}")
+        print(f"WF development window: {wf_dev_window.start} -> {wf_dev_window.end}")
 
     wf_ok = (wf_robust_ok and wf_all_folds_seq_ok) if not args.skip_wf else True
     if not args.skip_wf and not wf_ok:
@@ -606,8 +652,10 @@ def main(argv: list[str] | None = None) -> int:
                 args.timeframe,
                 params,
                 wf_dev_window,
+                instrument=instrument_obj,
                 risk_dollars=eval_risk,
                 max_contracts=max_contracts,
+                raw_frame=raw_1min,
             )
             return result.trades
 
@@ -641,7 +689,7 @@ def main(argv: list[str] | None = None) -> int:
             )
             _sens_mc_path = graphs_dir / f"{strategy_key}_{args.timeframe}_sensitivity_mc_paths.png"
             try:
-                plot_mc_paths(sensitivity_mc, _sens_mc_path, title=f"Sensitivity MC — {strategy_key} ({wf_dev_window.start}→{wf_dev_window.end})")
+                plot_mc_paths(sensitivity_mc, _sens_mc_path, title=f"Sensitivity MC — {strategy_key} ({wf_dev_window.start}->{wf_dev_window.end})")
                 sensitivity_heatmap_path = str(_sens_mc_path.resolve())
                 print(f"sensitivity_mc_paths={sensitivity_heatmap_path}")
             except Exception as exc:
@@ -665,8 +713,10 @@ def main(argv: list[str] | None = None) -> int:
         args.timeframe,
         selected_params,
         pipeline_windows.holdout,
+        instrument=instrument_obj,
         risk_dollars=eval_risk,
         max_contracts=max_contracts,
+        raw_frame=raw_1min,
     )
     print(
         f"holdout net_pnl={float(holdout_eval.metrics['total_net_pnl']):.2f} "
@@ -691,8 +741,9 @@ def main(argv: list[str] | None = None) -> int:
             bootstrap_iterations=args.longevity_bootstrap_iterations,
             confidence_level=args.longevity_confidence_level,
             coverage_threshold=args.risk_coverage_threshold,
+            instrument=instrument_obj,
         )
-        longevity_path = output_dir / f"{strategy_key}_holdout_longevity_optimization_mc.json"
+        longevity_path = json_dir / f"{strategy_key}_holdout_longevity_optimization_mc.json"
         _write_optimization_json(longevity_path, longevity_optimization_mc_result)
         longevity_optimization_path = str(longevity_path.resolve())
         _print_longevity_optimization_mc(longevity_optimization_mc_result)
@@ -711,8 +762,9 @@ def main(argv: list[str] | None = None) -> int:
                 longevity_optimization_mc_result,
                 fixed_risk_dollars=args.compare_fixed_risk,
                 fixed_contracts=args.compare_fixed_contracts,
+                instrument=instrument_obj,
             )
-            comparison_path = output_dir / f"{strategy_key}_sizing_comparison.json"
+            comparison_path = json_dir / f"{strategy_key}_sizing_comparison.json"
             payload = _json_safe(asdict(sizing_comparison_result))
             comparison_path.write_text(json.dumps(payload, indent=2, sort_keys=False, default=str) + "\n")
             print()
@@ -788,6 +840,9 @@ def main(argv: list[str] | None = None) -> int:
         holdout_net_pnl=float(holdout_eval.metrics["total_net_pnl"]),
         holdout_max_drawdown=float(holdout_eval.metrics["max_drawdown"]),
         holdout_mc_pnl_p05=float(holdout_mc.pnl_p05),
+        wf1_trade_count=int(wf_oos_final[0].metrics.get("total_trades", 0)) if len(wf_oos_final) > 0 else 0,
+        wf2_trade_count=int(wf_oos_final[1].metrics.get("total_trades", 0)) if len(wf_oos_final) > 1 else 0,
+        holdout_trade_count=int(holdout_eval.metrics.get("total_trades", 0)),
     )
     reason_parts: list[str] = []
     if verdict.reject_reasons:
@@ -822,6 +877,7 @@ def main(argv: list[str] | None = None) -> int:
 
     result_bundle: dict[str, Any] = {
         "strategy": strategy_key,
+        "instrument": instrument_key,
         "timeframe": args.timeframe,
         "data_dir": str(data_dir_path),
         "output_dir": str(output_dir),
@@ -861,8 +917,6 @@ def main(argv: list[str] | None = None) -> int:
         ),
     }
 
-    json_dir = output_dir / "json"
-    json_dir.mkdir(parents=True, exist_ok=True)
     out_json = json_dir / f"{strategy_key}_{args.timeframe}_result.json"
     out_json.write_text(json.dumps(result_bundle, indent=2, sort_keys=False, default=str) + "\n")
     txt_dir = output_dir / "txt summaries"
@@ -885,6 +939,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     table_rows: list[tuple[str, str]] = [
         ("strategy", strategy_key),
+        ("instrument", instrument_key),
         ("timeframe", args.timeframe),
         ("verdict", verdict.verdict),
         ("regime_fit", regime_result.verdict),
@@ -894,7 +949,7 @@ def main(argv: list[str] | None = None) -> int:
         ("holdout_mc_pnl_p05", f"{holdout_mc.pnl_p05:.2f}"),
         ("sensitivity_flag", sensitivity_flag_label),
         ("wf_oos_total_pnl", f"{wf_aggregate.get('wf_oos_total_pnl', 0.0):.2f}"),
-        ("wf_dev_window", f"{wf_dev_window.start} → {wf_dev_window.end}"),
+        ("wf_dev_window", f"{wf_dev_window.start} -> {wf_dev_window.end}"),
         ("result_json", str(out_json.resolve())),
     ]
     if summary_path is not None:
@@ -904,4 +959,37 @@ def main(argv: list[str] | None = None) -> int:
     if sensitivity_heatmap_path is not None:
         table_rows.append(("sensitivity_mc_graph", sensitivity_heatmap_path))
     for idx, path in enumerate(speed_optimization_paths, 1):
-        table_rows.append((f"wf{idx
+        table_rows.append((f"wf{idx}_speed_optimization", path))
+    if longevity_optimization_path is not None:
+        table_rows.append(("holdout_longevity_optimization", longevity_optimization_path))
+    if params_hash is not None and audit_path is not None:
+        table_rows.extend(
+            [
+                ("frozen_params_sha256", params_hash[:16] + "..."),
+                ("audit_stamp", str(audit_path.resolve())),
+                ("audit_log_jsonl", str(log_path.resolve())),
+            ]
+        )
+    _print_summary_table(table_rows)
+    return 0
+
+
+def _print_strategies() -> None:
+    for key in sorted(STRATEGIES):
+        spec = STRATEGIES[key]
+        requires = ", ".join(spec.requires) if spec.requires else "none"
+        filt = spec.filter_of if spec.filter_of is not None else "none"
+        print(f"{spec.name}: requires={requires}; filter_of={filt}")
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
+
+
+
+
+
+
+
+
