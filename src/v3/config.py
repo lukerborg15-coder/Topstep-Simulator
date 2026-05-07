@@ -7,7 +7,7 @@ from typing import Optional
 
 EASTERN_TZ = "America/New_York"
 SESSION_START = "09:30"
-SESSION_END = "15:00"
+SESSION_END = "16:00"
 
 # Resolve project root from this file's location:
 #   src/v3/config.py -> src/v3 -> src -> <project root>
@@ -19,7 +19,21 @@ PROJECT_ROOT = PACKAGE_ROOT.parent.parent
 DEFAULT_DATA_DIR = Path(os.environ.get("TOPSTEP_PIPELINE_DATA_DIR", str(PROJECT_ROOT / "Data")))
 OUTPUT_DIR = Path(os.environ.get("TOPSTEP_PIPELINE_OUTPUT_DIR", str(PROJECT_ROOT / "output")))
 
-TIMEFRAMES = ("1min", "5min", "15min")
+# Supported timeframes - all can be derived from 1-minute data
+# Format: (name, minutes) for easy resampling calculations
+TIMEFRAME_MINUTES: dict[str, int] = {
+    "1min": 1,
+    "2min": 2,
+    "3min": 3,
+    "5min": 5,
+    "15min": 15,
+    "30min": 30,
+    "1h": 60,
+    "4h": 240,
+}
+
+# Backwards-compatible tuple for simple iteration
+TIMEFRAMES = tuple(TIMEFRAME_MINUTES.keys())
 STRATEGY_NAMES = (
     "connors_rsi2",
     "ttm_squeeze",
@@ -29,6 +43,7 @@ STRATEGY_NAMES = (
     "session_pivot_rejection",
     "session_pivot_break",
     "hl2_sma_retrace_atr",
+    "vp_dual_mode",
 )
 
 
@@ -54,19 +69,19 @@ class PipelineWindows:
 
 
 # Two expanding WF folds; in_sample_sanity removed — OOS replaces it.
-# WF1 test covers 6 months; WF2 test covers remaining 6 months before holdout.
+# WF tests cover Mar-Nov 2023 and Dec 2023-Aug 2024 before holdout.
 # holdout unchanged: 2024-09-01 → 2026-03-18.
 WINDOWS = PipelineWindows(
     walk_forward=(
         WalkForwardWindow(
             "WF1",
-            DateWindow("WF1_train", "2022-09-01", "2023-08-31"),
-            DateWindow("WF1_test", "2023-09-01", "2024-02-29"),
+            DateWindow("WF1_train", "2021-03-19", "2023-02-28"),
+            DateWindow("WF1_test", "2023-03-01", "2023-11-30"),
         ),
         WalkForwardWindow(
             "WF2",
-            DateWindow("WF2_train", "2022-09-01", "2024-02-29"),
-            DateWindow("WF2_test", "2024-03-01", "2024-08-31"),
+            DateWindow("WF2_train", "2021-03-19", "2023-11-30"),
+            DateWindow("WF2_test", "2023-12-01", "2024-08-31"),
         ),
     ),
     holdout=DateWindow("holdout", "2024-09-01", "2026-03-18"),
@@ -89,6 +104,23 @@ class Instrument:
 
 
 MNQ = Instrument()
+
+# MES = Micro E-mini S&P 500
+# Assumptions based on CME specifications:
+# - Point value: $5 per point (MES moves in 0.25 increments = $1.25/tick)
+# - Tick size: 0.25 points = $1.25 per tick
+# - Commission: ~$0.85 round-turn (micro contracts have lower fees)
+# - Slippage: 0.25 points per side (same as MNQ)
+MES = Instrument(
+    symbol="MES",
+    point_value=5.0,
+    tick_size=0.25,
+    commission_round_turn=0.85,
+    slippage_points_per_side=0.25,
+)
+
+# Registry of available instruments for CLI validation
+INSTRUMENTS: dict[str, Instrument] = {"mnq": MNQ, "mes": MES}
 
 
 @dataclass(frozen=True)
@@ -202,3 +234,4 @@ DEFAULT_MAX_CONTRACTS = TOPSTEP_50K.max_micro_contracts
 DEFAULT_MIN_FOLD_SEQ_PASS_RATE_PCT = 40.0
 DEFAULT_SKIP_SENSITIVITY = True
 DEFAULT_STRICT_WF_GATE = False
+

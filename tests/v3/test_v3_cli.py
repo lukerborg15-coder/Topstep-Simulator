@@ -945,3 +945,243 @@ def test_sensitivity_runs_and_appears_in_result(
     assert "sensitivity_param_results" in sens
     assert "width" in sens["sensitivity_param_results"]
     assert blob["verdict"]["sensitivity_flag"] is False
+
+
+def test_cli_loads_raw_1min_and_passes_it_to_vp_eval_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    load_user_strategies()
+    exec_frame = pd.DataFrame()
+    raw_1min = pd.DataFrame({"close": [1.0]})
+    load_calls: list[tuple[str, bool]] = []
+    seen: dict[str, Any] = {}
+
+    class StopAfterHoldout(RuntimeError):
+        pass
+
+    def fake_load_ohlcv(*, instrument: str, timeframe: str, data_dir: Path, session_only: bool):
+        load_calls.append((timeframe, session_only))
+        return raw_1min if timeframe == "1min" else exec_frame
+
+    def fake_run_walk_forward(*args: Any, **kwargs: Any):
+        seen["wf_raw_frame"] = kwargs.get("raw_frame")
+        return {}, [], True
+
+    def fake_wf_oos(*args: Any, **kwargs: Any):
+        seen["wf_oos_raw_frame"] = kwargs.get("raw_frame")
+        return []
+
+    def fake_evaluate_strategy(*args: Any, **kwargs: Any):
+        seen["holdout_raw_frame"] = kwargs.get("raw_frame")
+        raise StopAfterHoldout()
+
+    monkeypatch.setattr(cli, "load_ohlcv", fake_load_ohlcv)
+    monkeypatch.setattr(cli, "run_walk_forward", fake_run_walk_forward)
+    monkeypatch.setattr(cli, "wf_oos_folds_for_selected_params", fake_wf_oos)
+    monkeypatch.setattr(cli, "evaluate_strategy", fake_evaluate_strategy)
+
+    with pytest.raises(StopAfterHoldout):
+        cli.main(
+            [
+                "--strategy", "vp_dual_mode",
+                "--data-dir", str(tmp_path),
+                "--output-dir", str(tmp_path / "out_vp_cli"),
+                "--skip-sensitivity",
+            ]
+        )
+
+    assert load_calls == [("5min", False), ("1min", False)]
+    assert seen["wf_raw_frame"] is raw_1min
+    assert seen["wf_oos_raw_frame"] is raw_1min
+    assert seen["holdout_raw_frame"] is raw_1min
+
+
+def test_cli_sensitivity_uses_raw_1min_for_vp_strategy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    load_user_strategies()
+    exec_frame = pd.DataFrame()
+    raw_1min = pd.DataFrame({"close": [1.0]})
+    seen: dict[str, Any] = {}
+    load_calls: list[tuple[str, bool]] = []
+
+    class StopAfterSensitivity(RuntimeError):
+        pass
+
+    def fake_load_ohlcv(*, instrument: str, timeframe: str, data_dir: Path, session_only: bool):
+        load_calls.append((timeframe, session_only))
+        return raw_1min if timeframe == "1min" else exec_frame
+
+    def fake_evaluate_strategy(*args: Any, **kwargs: Any):
+        seen["sensitivity_raw_frame"] = kwargs.get("raw_frame")
+        return _fake_eval(window="wf_dev")
+
+    def fake_run_sensitivity(**kwargs: Any):
+        kwargs["trades_fn"]({})
+        raise StopAfterSensitivity()
+
+    monkeypatch.setattr(cli, "load_ohlcv", fake_load_ohlcv)
+    monkeypatch.setattr(cli, "evaluate_strategy", fake_evaluate_strategy)
+    monkeypatch.setattr(cli, "run_sensitivity", fake_run_sensitivity)
+    monkeypatch.setattr(cli, "sensitivity_summary_dict", lambda report: {"unused": True})
+    monkeypatch.setattr(cli, "run_combine_simulator", lambda *args, **kwargs: _passing_combine())
+
+    with pytest.raises(StopAfterSensitivity):
+        cli.main(
+            [
+                "--strategy", "vp_dual_mode",
+                "--data-dir", str(tmp_path),
+                "--output-dir", str(tmp_path / "out_vp_sens"),
+                "--skip-wf",
+                "--mode", "full",
+            ]
+        )
+
+    assert seen["sensitivity_raw_frame"] is raw_1min
+    assert load_calls == [("5min", False), ("1min", False)]
+
+
+def test_cli_uses_full_session_exec_frame_and_passes_instrument_to_sizing_comparison(
+    cli_mock_registered: None,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    load_calls: list[tuple[str, bool]] = []
+    seen: dict[str, Any] = {}
+    trade = _sizing_trade()
+
+    def fake_load_ohlcv(*, instrument: str, timeframe: str, data_dir: Path, session_only: bool):
+        load_calls.append((timeframe, session_only))
+        return pd.DataFrame({"close": [1.0]}, index=[pd.Timestamp("2024-06-10 09:30", tz=EASTERN_TZ)])
+
+    def fake_run_walk_forward(*args: Any, **kwargs: Any):
+        return dict(MOCK_CLI_SPEC.default_params), [], True
+
+    def fake_wf_pairs(*args: Any, **kwargs: Any):
+        return [([trade], [trade])]
+
+    def fake_wf_oos(*args: Any, **kwargs: Any):
+        return []
+
+    def fake_eval(*args: Any, **kwargs: Any):
+        return _fake_eval(window="holdout", trade_results=[trade])
+
+    def fake_speed(*args: Any, **kwargs: Any):
+        return cli.SpeedOptimizationAggregateResult(
+            strategy="cli_e2e_mock",
+            pass_floor_pct=40.0,
+            speed_target_days=10.0,
+            attempt_budget=10,
+            n_folds=1,
+            optimal_risk_dollars=100.0,
+            median_oos_utility=1.0,
+            min_oos_utility=1.0,
+            median_oos_pass_rate_pct=70.0,
+            median_oos_median_days_to_pass=5.0,
+            viable_folds=1,
+        )
+
+    def fake_longevity(*args: Any, **kwargs: Any):
+        return cli.LongevityOptimizationMCResult(
+            strategy="cli_e2e_mock",
+            window="holdout",
+            min_profit_per_trade=150.0,
+            min_profit_factor=1.2,
+            weights={"survival_score": 0.4, "drawdown_score": 0.2, "efficiency_score": 0.2, "capital_score": 0.2},
+            mc_iterations=10,
+            mc_block_size=5,
+            bootstrap_iterations=10,
+            optimal_risk_dollars=150.0,
+            median_longevity_score=1.0,
+            p05_longevity_score=0.8,
+            median_components={},
+            p05_components={},
+            median_avg_pnl_per_trade=200.0,
+            p05_avg_pnl_per_trade=180.0,
+            median_accounts_used=1.0,
+            median_accounts_blown=0.0,
+        )
+
+    def fake_run_sizing_comparison(*args: Any, **kwargs: Any):
+        seen["comparison_instrument"] = kwargs.get("instrument")
+        return cli.SizingComparisonResult(
+            strategy="cli_e2e_mock",
+            fixed_risk_dollars=kwargs.get("fixed_risk_dollars"),
+            fixed_contracts=kwargs.get("fixed_contracts"),
+            track_a_optimizer={"eval_track": {"pass_rate_pct": 70.0}, "holdout_track": {"longevity_score": 1.0}},
+            track_b_fixed_risk=None,
+            track_c_fixed_contracts=None,
+            deltas={},
+            sanity_flags=(),
+        )
+
+    monkeypatch.setattr(cli, "load_ohlcv", fake_load_ohlcv)
+    monkeypatch.setattr(cli, "run_walk_forward", fake_run_walk_forward)
+    monkeypatch.setattr(cli, "wf_train_test_trades_for_selected_params", fake_wf_pairs)
+    monkeypatch.setattr(cli, "wf_oos_folds_for_selected_params", fake_wf_oos)
+    monkeypatch.setattr(cli, "evaluate_strategy", fake_eval)
+    monkeypatch.setattr(cli, "optimize_speed_wf_aggregate", fake_speed)
+    monkeypatch.setattr(cli, "optimize_longevity_holdout_mc", fake_longevity)
+    monkeypatch.setattr(cli, "run_sizing_comparison", fake_run_sizing_comparison)
+    monkeypatch.setattr(cli, "simulate_express_funded_resets", lambda *args, **kwargs: type("R", (), {
+        "funded_accounts_failed": 0,
+        "funded_accounts_used": 1,
+        "stints_opened": 1,
+        "accrued_pnl_bank": 0.0,
+        "max_nominal_peak_balance": 50000.0,
+    })())
+    monkeypatch.setattr(cli, "express_funded_reset_sim_summary_dict", lambda result: {})
+    monkeypatch.setattr(cli, "run_holdout_trade_monte_carlo", lambda *args, **kwargs: type("MC", (), {
+        "pnl_p05": 0.0,
+        "pnl_p50": 0.0,
+        "pnl_p95": 0.0,
+        "n_perms": 1,
+        "block_size": 1,
+        "seed": 1,
+        "ci_pct": 95.0,
+        "win_rate_mean": 0.0,
+        "win_rate_ci_lo": 0.0,
+        "win_rate_ci_hi": 0.0,
+        "expectancy_mean": 0.0,
+        "expectancy_ci_lo": 0.0,
+        "expectancy_ci_hi": 0.0,
+        "max_daily_loss_mean": 0.0,
+        "max_daily_loss_worst_p05": 0.0,
+        "dd_duration_mean": 0.0,
+        "dd_duration_p95": 0.0,
+        "max_dd_mean": 0.0,
+        "max_dd_p05": 0.0,
+        "max_dd_p95": 0.0,
+    })())
+    monkeypatch.setattr(cli, "holdout_monte_carlo_summary_dict", lambda result: {})
+    monkeypatch.setattr(cli, "mc_summary_text", lambda *args, **kwargs: "mc")
+    monkeypatch.setattr(cli, "classify_regime_fit", lambda *args, **kwargs: type("Regime", (), {"verdict": "mixed"})())
+    monkeypatch.setattr(cli, "regime_summary_dict", lambda result: {})
+    monkeypatch.setattr(cli, "regime_summary_text", lambda result: "regime")
+    monkeypatch.setattr(cli, "compute_pipeline_verdict", lambda *args, **kwargs: type("Verdict", (), {
+        "verdict": "REJECT",
+        "reject_reasons": [],
+        "warn_reasons": [],
+        "sensitivity_flag": None,
+    })())
+    monkeypatch.setattr(cli, "verdict_summary_dict", lambda result: {"verdict": result.verdict, "sensitivity_flag": result.sensitivity_flag})
+
+    code = cli.main(
+        [
+            "--strategy", "cli_e2e_mock",
+            "--instrument", "mes",
+            "--timeframe", "5min",
+            "--data-dir", str(tmp_path),
+            "--output-dir", str(tmp_path / "out_compare_mes"),
+            "--optimize-sizing-for-speed",
+            "--optimize-sizing-for-longevity",
+            "--compare-fixed-risk", "100",
+            "--force",
+        ]
+    )
+
+    assert code == 0
+    assert load_calls == [("5min", False)]
+    assert seen["comparison_instrument"].symbol == "MES"

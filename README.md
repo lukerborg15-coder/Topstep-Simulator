@@ -46,13 +46,20 @@ pip install -e .
 
 ## Data Setup
 
-Place MNQ OHLCV CSVs in `Data/` (project root). Expected naming convention:
+Place Databento-derived OHLCV CSVs in `Data/` (project root). Expected naming convention:
 
 ```
-Data/MNQ_5min.csv
-Data/MNQ_1min.csv
-Data/MNQ_15min.csv
+Data/mnq_1min_databento.csv
+Data/mnq_5min_databento.csv
+Data/mes_1min_databento.csv
 ```
+
+The loader and builder use lowercase instrument ids (`mnq`, `mes`) and the
+`{instrument}_{timeframe}_databento.csv` naming scheme.
+
+Related docs:
+
+- `docs/data/session_resampling.md` documents the session-aware resampling contract shared by the loader and data builder.
 
 Override via environment variable:
 
@@ -62,6 +69,9 @@ Override via environment variable:
 | `TOPSTEP_PIPELINE_OUTPUT_DIR` | Result JSON / artifacts (default: `<repo>/output`) |
 
 Or at runtime: `--data-dir /path/to/data`
+
+Large market data is intentionally kept out of git. Keep `Data/` local or in
+external storage; publish code, docs, and lightweight configuration only.
 
 ---
 
@@ -132,6 +142,7 @@ topstep-pipeline --strategy hl2_sma_retrace_atr --mode holdout-only
 | Flag | Default | Description |
 |---|---|---|
 | `--strategy` | required | Strategy key |
+| `--instrument` | `mnq` | `mnq` or `mes` |
 | `--mode` | `quick` | `quick`, `full`, or `holdout-only` |
 | `--timeframe` | `5min` | Bar timeframe (matches CSV filename) |
 | `--eval-risk` | `500` | Dollars risked per trade before contract cap |
@@ -149,7 +160,7 @@ topstep-pipeline --strategy hl2_sma_retrace_atr --mode holdout-only
 | `--compare-fixed-risk` | unset | Compare optimizer vs a fixed $/trade |
 | `--compare-fixed-contracts` | unset | Compare optimizer vs a fixed contract count |
 | `--output-dir` | `output/` | Root for JSON, summaries, frozen params |
-| `--data-dir` | `Data/` | Directory containing MNQ CSV bundles |
+| `--data-dir` | `Data/` | Directory containing `{instrument}_{timeframe}_databento.csv` files |
 | `--topstep-weight` | `1.0` | Walk-forward scoring weight for topstep_score |
 | `--avg-r-weight` | `25.0` | Walk-forward scoring weight for avg_r |
 
@@ -355,7 +366,7 @@ python -m pytest tests/v3/ -q
 | `src/v3/user_strategies/` | Drop-in user strategy files (auto-loaded) |
 | `tests/` | Pytest suite |
 | `config/` | Optional JSON date windows (`--pipeline-config`) |
-| `scripts/` | Standalone utilities (e.g. result JSON summarizer) |
+| `scripts/` | Standalone utilities (stable entrypoints at top level, probes under `diagnostics/`, data helpers under `data/`) |
 | `run-cli.cmd` | Windows launcher (sets PYTHONPATH to this repo's src/) |
 | `pyproject.toml` | Build config and dependencies |
 
@@ -390,3 +401,51 @@ python -m pytest tests/v3/ -q
 | `audit_stamp.py` | Audit JSON + JSONL append log |
 | `json_readable.py` | Result JSON → human-readable text export |
 | `user_strategies/hl2_sma_retrace_atr.py` | HL2 SMA retrace + ATR stop/target user strategy |
+
+---
+
+## Data Builder (`scripts/build_data.py`)
+
+Utility for building normalized OHLCV CSV artifacts from raw Databento exports.
+
+**Usage:**
+
+```bash
+# Resample existing 1min to higher timeframes
+python scripts/build_data.py --instrument mnq --timeframes 5min 15min
+
+# Normalize raw Databento source to 1min
+python scripts/build_data.py --instrument mes --timeframes 1min --source C:\path\to\source.zip
+
+# Full pipeline: normalize + generate higher timeframes
+python scripts/build_data.py --instrument mes --timeframes 5min 15min 1h --source C:\path\to\source.zip
+```
+
+**Arguments:**
+
+| Argument | Description |
+|---|---|
+| `--instrument` | `mnq` or `mes` |
+| `--timeframes` | Target timeframes (default: `1min`). Supports: `1min`, `2min`, `3min`, `5min`, `15min`, `30min`, `1h`, `4h` |
+| `--source` | Path to raw Databento ZIP or CSV (must contain `ts_event`, `open`, `high`, `low`, `close`, `volume`, `symbol`) |
+| `--output-dir` | Output directory (default: `Data/`) |
+
+**Output format:** `Data/{instrument}_{timeframe}_databento.csv`
+
+Columns: `datetime,open,high,low,close,volume`  
+Datetime format: `2021-03-18 20:00:00-04:00` (Eastern timezone with colon in offset)
+
+**Schema normalization:** Raw Databento timestamps (UTC) are converted to America/New_York timezone.
+
+**Continuous contract rule:** The builder only accepts strict outright symbols (`MES`/`MNQ` + month code + year digit), explicitly rejects spreads such as `MESM4-MESU4`, and creates a monotonic continuous series by holding the current contract until a later expiry beats it on total daily volume. This prevents spread contamination and avoids rolling backward into older expiries.
+
+## Diagnostics Scripts
+
+Local probes that are useful during data/runtime investigations now live under `scripts/diagnostics/` so the main repo entrypoints stay easy to scan.
+
+- `scripts/diagnostics/audit_regimes.py`
+- `scripts/diagnostics/test_mes_load.py`
+- `scripts/diagnostics/vp_sanity_check.py`
+- `scripts/diagnostics/analyze_mes_coverage.py`
+
+Data-specific helper wrappers that complement the main builder live under `scripts/data/`.

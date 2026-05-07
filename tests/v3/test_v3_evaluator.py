@@ -9,17 +9,29 @@ import pandas as pd
 import pytest
 
 import v3.evaluator as evaluator_module
-from v3.config import DEFAULT_RISK_DOLLARS, EASTERN_TZ, MNQ, TOPSTEP_50K, DateWindow, WINDOWS
+from v3.config import (
+    DEFAULT_RISK_DOLLARS,
+    EASTERN_TZ,
+    MES,
+    MNQ,
+    TOPSTEP_50K,
+    DateWindow,
+    PipelineWindows,
+    WINDOWS,
+    WalkForwardWindow,
+)
 from v3.evaluator import (
     EvaluationResult,
     aggregate_wf_metrics,
     all_folds_meet_min_seq_pass_rate,
+    attach_sequential_topstep_oos,
     compute_metrics,
     evaluate_strategy,
     fold_seq_eval_pass_rate,
     run_walk_forward,
     simulate_trades,
     walk_forward_development_window,
+    wf_train_test_trades_for_selected_params,
 )
 from v3.strategies import STRATEGIES, StrategySpec, TradeSignal
 from v3.trades import TradeResult
@@ -43,6 +55,8 @@ REQUIRED_WF_KEYS = {
     "wf_avg_net_pnl",
     "wf_oos_total_pnl",
     "wf_consistency",
+    "wf_avg_sharpe",
+    "wf_sharpe_by_fold",
     "wf_seq_eval_passes_by_fold",
     "wf_fold_seq_pass_rates",
 }
@@ -255,6 +269,26 @@ def test_fold_seq_eval_pass_rate_handles_attempts_and_explicit_rate() -> None:
     assert fold_seq_eval_pass_rate({"seq_eval_passes": 1, "seq_eval_attempts": 0}) == 0.0
 
 
+def test_attach_sequential_topstep_oos_records_passed_attempt_days(monkeypatch: pytest.MonkeyPatch) -> None:
+    result = EvaluationResult("u", "5m", {}, "W1", {}, {"topstep_passed": False, "topstep_days_to_pass": None}, [], None)
+
+    attempts = [
+        type("Attempt", (), {"passed": False, "days_to_pass": None})(),
+        type("Attempt", (), {"passed": True, "days_to_pass": 6})(),
+        type("Attempt", (), {"passed": True, "days_to_pass": 10})(),
+    ]
+    monkeypatch.setattr("v3.evaluator.count_sequential_eval_passes", lambda trades: (2, attempts))
+
+    attach_sequential_topstep_oos(result)
+
+    assert result.topstep["seq_eval_passes"] == 2
+    assert result.topstep["seq_eval_median_days_to_pass"] == 8.0
+    assert result.topstep["seq_eval_mean_days_to_pass"] == 8.0
+    assert result.topstep["seq_eval_min_days_to_pass"] == 6
+    assert result.topstep["seq_eval_max_days_to_pass"] == 10
+    assert result.topstep["seq_eval_first_pass_days_to_pass"] == 6
+
+
 def test_all_folds_meet_min_seq_pass_rate_borderline() -> None:
     folds = [
         EvaluationResult(
@@ -285,7 +319,7 @@ def test_simulate_trades_returns_trade_results_with_expected_fields() -> None:
     assert trade.exit_time in frame.index
     assert trade.contracts > 0
     assert trade.commission > 0.0
-    assert trade.exit_reason in {"target", "stop", "session_end", "data_end"}
+    assert trade.exit_reason in {"target", "stop", "data_end"}
     assert trade.bars_held >= 1
     assert isinstance(trade.params, dict)
 
@@ -330,11 +364,120 @@ def test_simulate_trades_applies_target_fill_commission_and_slippage() -> None:
     assert trade.r_multiple == expected_net / expected_risk
 
 
+def test_simulate_trades_uses_mes_economics() -> None:
+    frame = _two_bar_target_frame()
+    signal = TradeSignal(
+        time=frame.index[0],
+        direction="long",
+        entry=100.0,
+        stop=99.0,
+        target=102.0,
+        strategy="unit_eval",
+        params={"case": "mes_target"},
+    )
+
+    trades = simulate_trades(frame, [signal], instrument=MES, risk_dollars=DEFAULT_RISK_DOLLARS)
+
+    assert len(trades) == 1
+    trade = trades[0]
+    expected_contracts = min(
+        TOPSTEP_50K.max_micro_contracts,
+        int(DEFAULT_RISK_DOLLARS // ((signal.entry - signal.stop) * MES.point_value)),
+    )
+    expected_entry = signal.entry + MES.slippage_points_per_side
+    expected_exit = signal.target - MES.slippage_points_per_side
+    expected_gross = (expected_exit - expected_entry) * expected_contracts * MES.point_value
+    expected_commission = expected_contracts * MES.commission_round_turn
+
+    assert trade.contracts == expected_contracts
+    assert trade.entry == expected_entry
+    assert trade.exit == expected_exit
+    assert trade.gross_pnl == expected_gross
+    assert trade.commission == expected_commission
+
+
+def test_simulate_trades_does_not_force_flatten_at_session_end() -> None:
+    frame = pd.DataFrame(
+        {
+            "open": [100.0, 100.0, 100.0],
+            "high": [100.25, 100.25, 102.25],
+            "low": [99.75, 99.75, 99.75],
+            "close": [100.0, 100.1, 102.0],
+            "volume": [100, 100, 100],
+        },
+        index=pd.DatetimeIndex(
+            [
+                pd.Timestamp("2024-01-02 15:55", tz=EASTERN_TZ),
+                pd.Timestamp("2024-01-02 16:00", tz=EASTERN_TZ),
+                pd.Timestamp("2024-01-02 16:05", tz=EASTERN_TZ),
+            ]
+        ),
+    )
+    signal = TradeSignal(
+        time=frame.index[0],
+        direction="long",
+        entry=100.0,
+        stop=99.0,
+        target=102.0,
+        strategy="unit_eval",
+        params={"case": "no_session_flatten"},
+    )
+
+    trades = simulate_trades(frame, [signal], instrument=MNQ, risk_dollars=DEFAULT_RISK_DOLLARS)
+
+    assert len(trades) == 1
+    assert trades[0].exit_time == frame.index[2]
+    assert trades[0].exit_reason == "target"
+
+
 def test_compute_metrics_returns_required_keys() -> None:
     frame = _synthetic_ohlcv()
     metrics = compute_metrics(simulate_trades(frame, _manual_signals(frame)))
 
     assert REQUIRED_METRIC_KEYS <= set(metrics)
+
+
+def test_wf_train_test_trades_for_selected_params_passes_raw_frame(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    frame = _synthetic_ohlcv()
+    raw_frame = frame.copy()
+    windows = PipelineWindows(
+        walk_forward=(
+            WalkForwardWindow(
+                "WF1",
+                DateWindow("WF1_train", "2024-01-02", "2024-01-05"),
+                DateWindow("WF1_test", "2024-01-08", "2024-01-10"),
+            ),
+        ),
+        holdout=DateWindow("holdout", "2024-01-11", "2024-01-12"),
+    )
+    seen_raw_frames: list[pd.DataFrame | None] = []
+
+    def fake_evaluate_strategy(*args: Any, **kwargs: Any) -> EvaluationResult:
+        seen_raw_frames.append(kwargs.get("raw_frame"))
+        return EvaluationResult(
+            strategy="unit_eval",
+            timeframe="5min",
+            params={"step": 20},
+            window="stub",
+            metrics={"total_trades": 0, "avg_r": 0.0, "total_net_pnl": 0.0},
+            topstep={"topstep_passed": False, "topstep_score": 0.0},
+            trades=[],
+        )
+
+    monkeypatch.setattr(evaluator_module, "evaluate_strategy", fake_evaluate_strategy)
+
+    wf_train_test_trades_for_selected_params(
+        frame,
+        "unit_eval",
+        "5min",
+        {"step": 20},
+        windows,
+        raw_frame=raw_frame,
+    )
+
+    assert seen_raw_frames == [raw_frame, raw_frame]
 
 
 def test_compute_metrics_calculates_sharpe_and_average_duration() -> None:
