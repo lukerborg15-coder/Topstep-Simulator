@@ -652,6 +652,93 @@ def test_run_walk_forward_rejects_empty_candidate_grid(monkeypatch: Any) -> None
         run_walk_forward(_synthetic_ohlcv(), "unit_eval", "1d", max_grid=0)
 
 
+def test_run_walk_forward_samples_candidate_grid_deterministically(monkeypatch: Any) -> None:
+    _install_unit_strategy(monkeypatch)
+    seen: list[tuple[int, float]] = []
+
+    def fake_evaluate_strategy(
+        frame: pd.DataFrame,
+        strategy_name: str,
+        timeframe: str,
+        params: dict[str, Any],
+        window: Any,
+        **_: Any,
+    ) -> EvaluationResult:
+        seen.append((int(params["step"]), float(params["target_offset"])))
+        return EvaluationResult(
+            strategy=strategy_name,
+            timeframe=timeframe,
+            params=dict(params),
+            window=window.name,
+            metrics={"avg_r": 0.0, "total_net_pnl": 0.0},
+            topstep={"topstep_passed": False, "topstep_score": 0.0},
+            trades=[],
+        )
+
+    monkeypatch.setattr(evaluator_module, "evaluate_strategy", fake_evaluate_strategy)
+
+    run_walk_forward(_synthetic_ohlcv(), "unit_eval", "1d", grid_sample=2, grid_seed=7)
+    first_seen = list(seen)
+    seen.clear()
+    run_walk_forward(_synthetic_ohlcv(), "unit_eval", "1d", grid_sample=2, grid_seed=7)
+
+    assert seen == first_seen
+    train_calls_per_fold = 2
+    assert len(first_seen) >= train_calls_per_fold * len(WINDOWS.walk_forward)
+
+
+def test_run_walk_forward_grid_sample_does_not_materialize_full_grid(monkeypatch: Any) -> None:
+    def unused_generate(df: pd.DataFrame, params: dict[str, Any]) -> list[TradeSignal]:
+        return []
+
+    monkeypatch.setitem(
+        STRATEGIES,
+        "huge_grid_probe",
+        StrategySpec(
+            name="huge_grid_probe",
+            generate=unused_generate,
+            default_params={"a": 0, "b": 0},
+            param_grid={"a": tuple(range(10_000)), "b": tuple(range(10_000))},
+            max_signals_per_day=None,
+        ),
+    )
+
+    def explode_if_materialized(self: StrategySpec) -> list[dict[str, Any]]:
+        raise AssertionError("run_walk_forward must not call StrategySpec.grid() before sampling")
+
+    def fake_evaluate_strategy(
+        frame: pd.DataFrame,
+        strategy_name: str,
+        timeframe: str,
+        params: dict[str, Any],
+        window: Any,
+        **_: Any,
+    ) -> EvaluationResult:
+        return EvaluationResult(
+            strategy=strategy_name,
+            timeframe=timeframe,
+            params=dict(params),
+            window=window.name,
+            metrics={"avg_r": 0.0, "total_net_pnl": 0.0},
+            topstep={"topstep_passed": False, "topstep_score": 0.0},
+            trades=[],
+        )
+
+    monkeypatch.setattr(StrategySpec, "grid", explode_if_materialized)
+    monkeypatch.setattr(evaluator_module, "evaluate_strategy", fake_evaluate_strategy)
+
+    selected, folds, _wf_ok = run_walk_forward(
+        _synthetic_ohlcv(),
+        "huge_grid_probe",
+        "1d",
+        grid_sample=2,
+        grid_seed=42,
+    )
+
+    assert set(selected) == {"a", "b"}
+    assert len(folds) == len(WINDOWS.walk_forward)
+
+
 def test_aggregate_wf_metrics_returns_required_keys(monkeypatch: Any) -> None:
     _install_unit_strategy(monkeypatch)
     frame = _synthetic_ohlcv()

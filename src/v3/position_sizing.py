@@ -32,6 +32,9 @@ from .topstep import count_sequential_eval_passes
 from .trades import TradeResult
 
 
+DEFAULT_RISK_GRID: tuple[float, ...] = tuple(float(v) for v in range(50, 1000, 50))
+
+
 # =============================================================================
 # Dataclasses
 # =============================================================================
@@ -230,45 +233,72 @@ def _profit_factor(trades: list[TradeResult]) -> float:
     return wins / losses
 
 
+def _clamp01(value: float) -> float:
+    return max(0.0, min(1.0, float(value)))
+
+
+def _true_longevity_score(
+    bank_return: float,
+    survival_factor: float,
+    drawdown_factor: float,
+    consistency_factor: float,
+    account_efficiency_factor: float,
+) -> float:
+    return (
+        max(0.0, float(bank_return))
+        * _clamp01(survival_factor)
+        * _clamp01(drawdown_factor)
+        * _clamp01(consistency_factor)
+        * max(0.0, float(account_efficiency_factor))
+    )
+
+
+def _true_longevity_components_from_sim(
+    sim_result,
+    rules: FundedExpressSimRules,
+    *,
+    consistency_factor: float = 1.0,
+) -> dict[str, float]:
+    accounts_used = max(1, int(sim_result.funded_accounts_used))
+    accounts_blown = int(sim_result.funded_accounts_failed)
+    bank_return = max(0.0, 1.0 + float(sim_result.accrued_pnl_bank) / float(rules.account_size))
+    survival = _clamp01(1.0 - (accounts_blown / accounts_used))
+    worst_dd = float(sim_result.worst_stint_peak_to_trough_drawdown_from_peak_balance)
+    drawdown = _clamp01(1.0 - (worst_dd / rules.max_drawdown) if rules.max_drawdown > 0 else 0.0)
+    account_efficiency = 1.0 / math.sqrt(accounts_used)
+    consistency = _clamp01(consistency_factor)
+    longevity = _true_longevity_score(bank_return, survival, drawdown, consistency, account_efficiency)
+    return {
+        "bank_return_score": bank_return,
+        "survival_score": survival,
+        "drawdown_score": drawdown,
+        "consistency_score": consistency,
+        "account_efficiency_score": account_efficiency,
+        "longevity_score": longevity,
+        "accounts_used": float(accounts_used),
+        "accounts_blown": float(accounts_blown),
+    }
+
+
 def _compute_longevity_components(
     sim_result,
     rules: FundedExpressSimRules,
     target_pnl_per_trade: float,
     weights: dict[str, float],
 ) -> dict[str, float]:
-    """Compute weighted longevity components from a funded sim result."""
-    accounts_used = max(1, sim_result.funded_accounts_used)
-    accounts_blown = sim_result.funded_accounts_failed
-    survival = max(0.0, (accounts_used - accounts_blown) / accounts_used)
-
-    max_dd_limit = rules.max_drawdown
-    worst_dd = sim_result.worst_stint_peak_to_trough_drawdown_from_peak_balance
-    drawdown = max(0.0, min(1.0, 1.0 - (worst_dd / max_dd_limit) if max_dd_limit > 0 else 0.0))
-
+    """Compute true longevity components plus legacy diagnostics from a funded sim result."""
+    components = _true_longevity_components_from_sim(sim_result, rules)
     total_trades = sum(int(s.get("trades_applied_count", 0)) for s in sim_result.stints_summary)
     total_pnl = sim_result.accrued_pnl_bank
     avg_pnl = (total_pnl / total_trades) if total_trades > 0 else 0.0
     efficiency = (avg_pnl / target_pnl_per_trade) if target_pnl_per_trade > 0 else 0.0
-
     capital = total_pnl / rules.account_size if rules.account_size > 0 else 0.0
-
-    longevity = (
-        weights.get("survival", 0.4) * survival
-        + weights.get("drawdown", 0.2) * drawdown
-        + weights.get("efficiency", 0.2) * efficiency
-        + weights.get("capital", 0.2) * capital
-    )
-
-    return {
-        "survival_score": survival,
-        "drawdown_score": drawdown,
+    components.update({
         "efficiency_score": efficiency,
         "capital_score": capital,
-        "longevity_score": longevity,
         "avg_pnl_per_trade": avg_pnl,
-        "accounts_used": accounts_used,
-        "accounts_blown": accounts_blown,
-    }
+    })
+    return components
 
 
 def _get_valid_risk_levels(
@@ -400,7 +430,7 @@ def optimize_for_speed_wf(
 ) -> SpeedOptimizationResult:
     """LEGACY single-fold speed optimizer."""
     if risk_levels is None:
-        risk_levels = [50.0, 75.0, 100.0, 150.0, 200.0, 300.0, 400.0, 500.0]
+        risk_levels = list(DEFAULT_RISK_GRID)
 
     empty = SpeedOptimizationResult(
         strategy=strategy, window=window,
@@ -452,7 +482,7 @@ def optimize_for_longevity_holdout(
 ) -> LongevityOptimizationResult:
     """LEGACY deterministic longevity optimizer."""
     if risk_levels is None:
-        risk_levels = [50.0, 75.0, 100.0, 150.0, 200.0, 300.0, 400.0, 500.0]
+        risk_levels = list(DEFAULT_RISK_GRID)
 
     empty = LongevityOptimizationResult(
         strategy=strategy, window=window,
@@ -531,7 +561,7 @@ def optimize_speed_wf_aggregate(
     among risks that were viable in >= min_viable_folds folds (default ceil(n_folds/2)).
     """
     if risk_levels is None:
-        risk_levels = [50.0, 75.0, 100.0, 150.0, 200.0, 300.0, 400.0, 500.0]
+        risk_levels = list(DEFAULT_RISK_GRID)
 
     n_folds = len(fold_trade_pairs)
     if min_viable_folds is None:
@@ -571,7 +601,16 @@ def optimize_speed_wf_aggregate(
                 train_m["pass_rate_pct"] / 100.0, train_m["median_days_to_pass"], speed_target_days
             )
             if train_m["utility"] <= 0 or train_m["pass_rate_pct"] < pass_floor_pct:
-                oos_metrics.append({"fold_index": fold_idx, "risk_dollars": risk, "viable": False})
+                test_m = _evaluate_risk_on_trades(test_trades, risk, rules, attempt_budget, instrument)
+                test_m["utility"] = _speed_utility(
+                    test_m["pass_rate_pct"] / 100.0, test_m["median_days_to_pass"], speed_target_days
+                )
+                test_m["viable"] = False
+                test_m["fold_index"] = fold_idx
+                test_m["train_utility"] = train_m["utility"]
+                test_m["train_pass_rate_pct"] = train_m["pass_rate_pct"]
+                test_m["reject_reason"] = "train_pass_floor_or_utility"
+                oos_metrics.append(test_m)
                 continue
             viable_train += 1
             train_utilities.append(train_m["utility"])
@@ -584,12 +623,13 @@ def optimize_speed_wf_aggregate(
             test_m["train_utility"] = train_m["utility"]
             oos_metrics.append(test_m)
 
-        oos_utilities = [m["utility"] for m in oos_metrics if m.get("viable")]
-        oos_pass_rates = [m["pass_rate_pct"] for m in oos_metrics if m.get("viable")]
+        measured_oos = [m for m in oos_metrics if "utility" in m]
+        oos_utilities = [m["utility"] for m in measured_oos]
+        oos_pass_rates = [m["pass_rate_pct"] for m in measured_oos]
         oos_medians = [
             m["median_days_to_pass"]
-            for m in oos_metrics
-            if m.get("viable") and math.isfinite(m["median_days_to_pass"])
+            for m in measured_oos
+            if math.isfinite(m["median_days_to_pass"])
         ]
         per_risk[risk] = {
             "risk_dollars": risk,
@@ -603,9 +643,33 @@ def optimize_speed_wf_aggregate(
 
     survivors = [c for c in per_risk.values() if c["viable_folds"] >= min_viable_folds]
     if not survivors:
-        # Return all as candidates so user sees the data
-        all_candidates = tuple(sorted(per_risk.values(), key=lambda c: -c["median_oos_utility"]))
-        return replace(empty, candidates=all_candidates[:5])
+        # No candidate met the hard viability floor. Still surface the best measured
+        # risk so fixed-risk comparisons have a real optimizer track instead of $0.
+        all_candidates = tuple(
+            sorted(
+                per_risk.values(),
+                key=lambda c: (
+                    -c["median_oos_pass_rate_pct"],
+                    c["median_oos_median_days_to_pass"] if math.isfinite(c["median_oos_median_days_to_pass"]) else float("inf"),
+                    -c["median_oos_utility"],
+                    -c["min_oos_utility"],
+                ),
+            )
+        )
+        if not all_candidates:
+            return empty
+        best = all_candidates[0]
+        return replace(
+            empty,
+            optimal_risk_dollars=best["risk_dollars"],
+            median_oos_utility=best["median_oos_utility"],
+            min_oos_utility=best["min_oos_utility"],
+            median_oos_pass_rate_pct=best["median_oos_pass_rate_pct"],
+            median_oos_median_days_to_pass=best["median_oos_median_days_to_pass"],
+            viable_folds=best["viable_folds"],
+            per_fold_oos=best["per_fold"],
+            candidates=all_candidates[:5],
+        )
 
     survivors_sorted = sorted(
         survivors,
@@ -649,11 +713,12 @@ def optimize_longevity_holdout_mc(
 ) -> LongevityOptimizationMCResult:
     """Block-bootstrap MC longevity optimization.
 
-    Per risk: bootstrap-CI floor on avg_pnl/trade, profit-factor floor, MC over funded sim,
-    p05(survival_score) hard filter. Rank by median(longevity_score).
+    Per risk: compute bootstrap diagnostics and MC funded-account longevity. Rank by
+    measured median longevity score. The thresholds are reported as diagnostics only;
+    they do not gate candidates out of the optimizer.
     """
     if risk_levels is None:
-        risk_levels = [50.0, 75.0, 100.0, 150.0, 200.0, 300.0, 400.0, 500.0]
+        risk_levels = list(DEFAULT_RISK_GRID)
     if weights is None:
         weights = {"survival": 0.4, "drawdown": 0.2, "efficiency": 0.2, "capital": 0.2}
 
@@ -687,27 +752,12 @@ def optimize_longevity_holdout_mc(
         if not resized:
             continue
 
-        # Profit factor floor
         pf = _profit_factor(resized)
-        if pf < min_profit_factor:
-            results.append({
-                "risk_dollars": risk, "rejected": True, "reject_reason": f"profit_factor {pf:.2f} < {min_profit_factor}",
-                "median_longevity_score": 0.0,
-            })
-            continue
-
-        # Bootstrap CI floor on avg_pnl/trade
         p05_avg = _bootstrap_pnl_p05(resized, n=bootstrap_iterations, seed=42, percentile=p_pct)
-        if p05_avg < min_profit_per_trade:
-            results.append({
-                "risk_dollars": risk, "rejected": True,
-                "reject_reason": f"p05 avg_pnl {p05_avg:.1f} < {min_profit_per_trade}",
-                "median_longevity_score": 0.0,
-            })
-            continue
 
         # Baseline (deterministic) sim for surfaced per-account survival data
         baseline_sim = simulate_express_funded_resets(resized, rules)
+        comparison_longevity_score = 1.0 + baseline_sim.accrued_pnl_bank / rules.account_size
         baseline_components = _compute_longevity_components(
             baseline_sim, rules, min_profit_per_trade, weights
         )
@@ -715,8 +765,9 @@ def optimize_longevity_holdout_mc(
         # MC loop
         comp_lists: dict[str, list[float]] = {
             "survival_score": [], "drawdown_score": [], "efficiency_score": [],
-            "capital_score": [], "longevity_score": [], "avg_pnl_per_trade": [],
-            "accounts_used": [], "accounts_blown": [],
+            "capital_score": [], "bank_return_score": [], "account_efficiency_score": [],
+            "consistency_score": [],
+            "longevity_score": [], "avg_pnl_per_trade": [], "accounts_used": [], "accounts_blown": [],
         }
         for permuted in _block_bootstrap_trade_sequences(
             resized, n=mc_iterations, block_size=mc_block_size, seed=42
@@ -728,23 +779,58 @@ def optimize_longevity_holdout_mc(
 
         median_comps = {k: float(np.median(v)) if v else 0.0 for k, v in comp_lists.items()}
         p05_comps = {k: float(np.percentile(v, p_pct)) if v else 0.0 for k, v in comp_lists.items()}
-
-        # Hard survival filter
-        if p05_comps["survival_score"] < 0.5:
-            results.append({
-                "risk_dollars": risk, "rejected": True,
-                "reject_reason": f"p05 survival {p05_comps['survival_score']:.2f} < 0.5",
-                "median_longevity_score": median_comps["longevity_score"],
-            })
-            continue
+        consistency_factor = (
+            _clamp01(p05_comps["bank_return_score"] / median_comps["bank_return_score"])
+            if median_comps["bank_return_score"] > 0.0
+            else 0.0
+        )
+        true_longevity_score = _true_longevity_score(
+            median_comps["bank_return_score"],
+            median_comps["survival_score"],
+            median_comps["drawdown_score"],
+            consistency_factor,
+            median_comps["account_efficiency_score"],
+        )
+        p05_longevity_score = _true_longevity_score(
+            p05_comps["bank_return_score"],
+            p05_comps["survival_score"],
+            p05_comps["drawdown_score"],
+            consistency_factor,
+            p05_comps["account_efficiency_score"],
+        )
 
         results.append({
             "risk_dollars": risk,
             "rejected": False,
-            "median_longevity_score": median_comps["longevity_score"],
-            "p05_longevity_score": p05_comps["longevity_score"],
-            "median_components": {k: median_comps[k] for k in ("survival_score", "drawdown_score", "efficiency_score", "capital_score")},
-            "p05_components": {k: p05_comps[k] for k in ("survival_score", "drawdown_score", "efficiency_score", "capital_score")},
+            "profit_factor": pf,
+            "profit_factor_floor": min_profit_factor,
+            "p05_avg_pnl_floor": min_profit_per_trade,
+            "comparison_longevity_score": comparison_longevity_score,
+            "mc_median_longevity_score": median_comps["longevity_score"],
+            "median_longevity_score": true_longevity_score,
+            "p05_longevity_score": p05_longevity_score,
+            "median_components": {
+                k: median_comps[k]
+                for k in (
+                    "bank_return_score",
+                    "survival_score",
+                    "drawdown_score",
+                    "efficiency_score",
+                    "capital_score",
+                    "account_efficiency_score",
+                )
+            } | {"consistency_score": consistency_factor},
+            "p05_components": {
+                k: p05_comps[k]
+                for k in (
+                    "bank_return_score",
+                    "survival_score",
+                    "drawdown_score",
+                    "efficiency_score",
+                    "capital_score",
+                    "account_efficiency_score",
+                )
+            } | {"consistency_score": consistency_factor},
             "median_avg_pnl_per_trade": median_comps["avg_pnl_per_trade"],
             "p05_avg_pnl_per_trade": p05_comps["avg_pnl_per_trade"],
             "median_accounts_used": median_comps["accounts_used"],
@@ -756,8 +842,32 @@ def optimize_longevity_holdout_mc(
 
     survivors = [r for r in results if not r.get("rejected")]
     if not survivors:
-        # No survivors — return empty result with candidate diagnostics
-        return replace(empty, candidates=tuple(results[:8]))
+        # No survivor passed every hard longevity filter. Still return the best
+        # measured risk so reports/comparisons do not collapse to a fake $0 track.
+        all_candidates = tuple(
+            sorted(
+                results,
+                key=lambda r: (-float(r.get("median_longevity_score", 0.0)), -float(r.get("p05_longevity_score", 0.0))),
+            )
+        )
+        if not all_candidates:
+            return empty
+        best = all_candidates[0]
+        return replace(
+            empty,
+            optimal_risk_dollars=best["risk_dollars"],
+            median_longevity_score=float(best.get("median_longevity_score", 0.0)),
+            p05_longevity_score=float(best.get("p05_longevity_score", 0.0)),
+            median_components=dict(best.get("median_components", {})),
+            p05_components=dict(best.get("p05_components", {})),
+            median_avg_pnl_per_trade=float(best.get("median_avg_pnl_per_trade", 0.0)),
+            p05_avg_pnl_per_trade=float(best.get("p05_avg_pnl_per_trade", 0.0)),
+            median_accounts_used=float(best.get("median_accounts_used", 0.0)),
+            median_accounts_blown=float(best.get("median_accounts_blown", 0.0)),
+            per_account_survival_days=tuple(best.get("baseline_survival_days", ())),
+            per_account_summary=tuple(best.get("baseline_per_account", ())),
+            candidates=all_candidates[:8],
+        )
 
     survivors_sorted = sorted(
         survivors,
@@ -794,6 +904,7 @@ __all__ = [
     "LongevityOptimizationResult",
     "SpeedOptimizationAggregateResult",
     "LongevityOptimizationMCResult",
+    "DEFAULT_RISK_GRID",
     "optimize_for_speed_wf",
     "optimize_for_longevity_holdout",
     "optimize_speed_wf_aggregate",

@@ -45,3 +45,8 @@ IMPLEMENTATION_SUMMARY.md
 WHY_I_OVERESTIMATED.md
 .claude/
 tmp_pytest*/
+
+# Local generated artifacts
+03_Outputs/
+.minimax/
+How to create agent prompts/pipeline_repair_prompt_pack/

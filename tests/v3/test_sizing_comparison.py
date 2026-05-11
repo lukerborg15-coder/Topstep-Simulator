@@ -266,3 +266,48 @@ def test_run_sizing_comparison_sanity_flags_small_sample():
 
     # Should have sanity flag about small sample
     assert any("small" in flag.lower() for flag in result.sanity_flags)
+
+
+def test_run_sizing_comparison_accepts_fold_index_key_in_optimizer_rows():
+    fold_pairs = [
+        ([_make_trade(i, 200.0) for i in range(1, 8)], [_make_trade(i, 150.0) for i in range(8, 12)]),
+        ([_make_trade(i, 200.0) for i in range(12, 18)], [_make_trade(i, 150.0) for i in range(18, 22)]),
+    ]
+    holdout = [_make_trade(i, 200.0) for i in range(22, 31)]
+    speed_result = SpeedOptimizationAggregateResult(
+        strategy="test",
+        pass_floor_pct=40.0,
+        speed_target_days=5.0,
+        attempt_budget=10,
+        n_folds=2,
+        viable_folds=1,
+        optimal_risk_dollars=100.0,
+        median_oos_utility=0.75,
+        min_oos_utility=0.75,
+        median_oos_pass_rate_pct=75.0,
+        median_oos_median_days_to_pass=3.0,
+        per_fold_oos=({"fold_index": 0, "risk_dollars": 100.0, "viable": True},),
+    )
+    longevity_result = LongevityOptimizationMCResult(
+        strategy="test",
+        window="holdout",
+        min_profit_per_trade=150.0,
+        min_profit_factor=1.2,
+        weights={"survival_score": 0.4, "drawdown_score": 0.2, "efficiency_score": 0.2, "capital_score": 0.2},
+        mc_iterations=500,
+        mc_block_size=5,
+        bootstrap_iterations=1000,
+        optimal_risk_dollars=75.0,
+        median_longevity_score=0.85,
+        p05_longevity_score=0.70,
+        median_components={},
+        p05_components={},
+        median_avg_pnl_per_trade=200.0,
+        p05_avg_pnl_per_trade=180.0,
+        median_accounts_used=1.0,
+        median_accounts_blown=0.0,
+    )
+
+    result = run_sizing_comparison(fold_pairs, holdout, speed_result, longevity_result)
+
+    assert any("viable in only 1/2 folds" in flag for flag in result.sanity_flags)

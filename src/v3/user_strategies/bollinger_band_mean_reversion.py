@@ -28,21 +28,22 @@ def _exit_bar_index(
     stop: float,
     target: float,
     is_long: bool,
+    session_end_time,
 ) -> int:
     """Exit bar following evaluator.simulate_trades ordering (stop before target same bar)."""
-    session_end_time = pd.Timestamp(SESSION_END).time()
+    high = df["high"]
+    low = df["low"]
     for j in range(entry_idx + 1, len(df)):
-        row = df.iloc[j]
         ts = df.index[j]
         if is_long:
-            if row["low"] <= stop:
+            if low.iloc[j] <= stop:
                 return j
-            if row["high"] >= target:
+            if high.iloc[j] >= target:
                 return j
         else:
-            if row["high"] >= stop:
+            if high.iloc[j] >= stop:
                 return j
-            if row["low"] <= target:
+            if low.iloc[j] <= target:
                 return j
         if ts.time() >= session_end_time:
             return j
@@ -98,7 +99,8 @@ def bollinger_band_mean_reversion_generate(df: pd.DataFrame, params: dict) -> li
         # Resample from primary (LT) data if HTF file not available
         htf_df = resample_ohlcv(df, htf_timeframe, session_only=True)
     
-    ltf_df = df.copy()  # Primary is already LTF
+    ltf_df = df  # Primary is already LTF; this strategy only reads from it.
+    ltf_close = ltf_df["close"]
 
     if len(htf_df) < max(htf_rsi_period, htf_adx_period, bb_period) + 1:
         return []
@@ -117,8 +119,8 @@ def bollinger_band_mean_reversion_generate(df: pd.DataFrame, params: dict) -> li
     ltf_st_dir = st_data["dir"]
 
     # Bollinger Bands on LTF
-    bb_mid = ltf_df["close"].rolling(bb_period, min_periods=bb_period).mean()
-    bb_std_val = ltf_df["close"].rolling(bb_period, min_periods=bb_period).std()
+    bb_mid = ltf_close.rolling(bb_period, min_periods=bb_period).mean()
+    bb_std_val = ltf_close.rolling(bb_period, min_periods=bb_period).std()
     bb_upper = bb_mid + bb_std * bb_std_val
     bb_lower = bb_mid - bb_std * bb_std_val
 
@@ -131,13 +133,14 @@ def bollinger_band_mean_reversion_generate(df: pd.DataFrame, params: dict) -> li
 
     # Warmup period
     warmup = max(htf_rsi_period, htf_adx_period, ltf_adx_period, bb_period, supertrend_period, atr_period) + 1
+    session_end_time = pd.Timestamp(SESSION_END).time()
 
     for i in range(warmup, len(ltf_df)):
         if i < next_allowed:
             continue
 
         ts = ltf_df.index[i]
-        if ts.time() >= pd.Timestamp(SESSION_END).time():
+        if ts.time() >= session_end_time:
             continue
 
         # Current values
@@ -155,7 +158,7 @@ def bollinger_band_mean_reversion_generate(df: pd.DataFrame, params: dict) -> li
         if a <= 0:
             continue
 
-        entry_price = float(ltf_df["close"].iloc[i])
+        entry_price = float(ltf_close.iloc[i])
         bb_u = bb_upper.iloc[i]
         bb_l = bb_lower.iloc[i]
         bb_m = bb_mid.iloc[i]
@@ -201,7 +204,8 @@ def bollinger_band_mean_reversion_generate(df: pd.DataFrame, params: dict) -> li
                 ltf_df, i,
                 stop=stop_price,
                 target=target_price,
-                is_long=(direction == 1)
+                is_long=(direction == 1),
+                session_end_time=session_end_time,
             ) + cooldown_bars
 
     return signals

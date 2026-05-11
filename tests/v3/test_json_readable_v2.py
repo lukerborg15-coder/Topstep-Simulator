@@ -37,6 +37,43 @@ def test_readable_text_includes_verdict():
     assert "High pass rate" in text
 
 
+def test_readable_text_uses_current_verdict_contract():
+    """verdict.verdict and reject/warn reasons must render directly."""
+    data = {
+        "strategy": "test",
+        "timeframe": "5min",
+        "verdict": {
+            "verdict": "REJECT",
+            "reject_reasons": ["holdout_total_net_pnl_negative"],
+            "warn_reasons": ["holdout_max_drawdown_extremely_high"],
+        },
+    }
+
+    text = pipeline_result_bundle_to_readable_text(data)
+
+    assert "VERDICT: REJECT" in text
+    assert "UNKNOWN" not in text
+    assert "holdout_total_net_pnl_negative" in text
+    assert "holdout_max_drawdown_extremely_high" in text
+
+
+def test_readable_text_uses_walk_forward_best_params():
+    """CLI writes walk_forward.best_params, not selected_params."""
+    data = {
+        "strategy": "test",
+        "timeframe": "5min",
+        "walk_forward": {
+            "best_params": {"width": 2.0, "lookback": 15},
+            "oos_folds": [],
+        },
+    }
+
+    text = pipeline_result_bundle_to_readable_text(data)
+
+    assert "width=2.0" in text
+    assert "lookback=15" in text
+
+
 def test_readable_text_includes_speed_optimization():
     """Test speed optimization section."""
     data = {
@@ -202,3 +239,104 @@ def test_readable_text_includes_sizing_comparison():
     assert "Fixed $/trade" in text
     assert "SANITY FLAGS" in text
     assert "Small sample" in text
+
+
+def test_readable_text_renders_optimizer_diagnostics_without_zero_recommendation():
+    data = {
+        "strategy": "test",
+        "timeframe": "5min",
+        "speed_optimization_aggregate": {
+            "optimal_risk_dollars": 0.0,
+            "median_oos_utility": 0.0,
+            "min_oos_utility": 0.0,
+            "median_oos_pass_rate_pct": 0.0,
+            "median_oos_median_days_to_pass": 0.0,
+            "viable_folds": 0,
+            "n_folds": 2,
+            "candidates": [
+                {
+                    "risk_dollars": 100.0,
+                    "viable_folds": 0,
+                    "median_oos_utility": 0.2,
+                    "median_oos_pass_rate_pct": 35.0,
+                    "median_oos_median_days_to_pass": 9.0,
+                }
+            ],
+        },
+        "longevity_optimization": {
+            "optimal_risk_dollars": 0.0,
+            "median_longevity_score": 0.0,
+            "p05_longevity_score": 0.0,
+            "median_components": {},
+            "p05_components": {},
+            "candidates": [
+                {
+                    "risk_dollars": 150.0,
+                    "rejected": True,
+                    "reject_reason": "profit_factor 1.00 < 1.2",
+                    "median_longevity_score": 0.0,
+                }
+            ],
+        },
+    }
+
+    text = pipeline_result_bundle_to_readable_text(data)
+
+    assert "Winner: n/a (no viable risk)" in text
+    assert "$0/trade" not in text
+    assert "$100" in text
+
+
+def test_readable_text_handles_json_null_optimizer_metrics():
+    data = {
+        "strategy": "test",
+        "timeframe": "5min",
+        "timestamp": "2024-01-15",
+        "speed_optimization_aggregate": {
+            "optimal_risk_dollars": 50.0,
+            "median_oos_utility": None,
+            "min_oos_utility": None,
+            "median_oos_pass_rate_pct": None,
+            "median_oos_median_days_to_pass": None,
+            "viable_folds": 0,
+            "n_folds": 2,
+            "candidates": [{"risk_dollars": 50.0, "median_oos_median_days_to_pass": None, "median_oos_pass_rate_pct": None}],
+        },
+    }
+
+    text = pipeline_result_bundle_to_readable_text(data)
+
+    assert "Winner: $50/trade" in text
+    assert "n/a" in text
+    assert "0/2 folds" in text
+
+
+def test_readable_text_renders_optimizer_vs_fixed_comparison_values():
+    data = {
+        "strategy": "test",
+        "timeframe": "5min",
+        "sizing_comparison": {
+            "track_a_optimizer": {
+                "eval_track": {"risk_dollars": 100.0, "pass_rate_pct": 75.0, "median_days_to_pass": 8.0},
+                "holdout_track": {"risk_dollars": 150.0, "longevity_score": 1.25},
+            },
+            "track_b_fixed_risk": {
+                "risk_dollars": 200.0,
+                "eval_track": {"pass_rate_pct": 65.0, "median_days_to_pass": 11.0},
+                "holdout_track": {"longevity_score": 0.90},
+            },
+            "track_c_fixed_contracts": {
+                "fixed_contracts": 3,
+                "eval_track": {"pass_rate_pct": 55.0, "median_days_to_pass": 14.0},
+                "holdout_track": {"longevity_score": 0.60},
+            },
+            "deltas": {"fixed_risk_vs_optimizer": {"eval_pass_rate_delta": -10.0}},
+        },
+    }
+
+    text = pipeline_result_bundle_to_readable_text(data)
+
+    assert "$100 eval / $150 funded" in text
+    assert "$200" in text
+    assert "3 contracts" in text
+    assert "fixed_risk_vs_optimizer" in text

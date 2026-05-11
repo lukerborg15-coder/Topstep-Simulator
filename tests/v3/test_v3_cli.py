@@ -22,7 +22,13 @@ from v3.config import (
     PipelineWindows,
     WalkForwardWindow,
 )
-from v3.position_sizing import LongevityOptimizationResult, SpeedOptimizationResult
+from v3.position_sizing import (
+    LongevityOptimizationMCResult,
+    LongevityOptimizationResult,
+    SpeedOptimizationAggregateResult,
+    SpeedOptimizationResult,
+)
+from v3.sizing_comparison import SizingComparisonResult
 from v3.strategies import STRATEGIES, StrategySpec, TradeSignal, load_user_strategies, register_strategy
 from v3.trades import TradeResult
 
@@ -1039,6 +1045,233 @@ def test_cli_passes_mes_instrument_into_sizing_comparison(
 
     assert captured["fold_pairs_instrument"].symbol == "MES"
     assert captured["instrument"].symbol == "MES"
+
+
+def test_cli_speed_aggregate_printer_does_not_present_zero_risk_as_winner(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    result = SpeedOptimizationAggregateResult(
+        strategy="cli_e2e_mock",
+        pass_floor_pct=40.0,
+        speed_target_days=10.0,
+        attempt_budget=10,
+        n_folds=2,
+        optimal_risk_dollars=0.0,
+        median_oos_utility=0.0,
+        min_oos_utility=0.0,
+        median_oos_pass_rate_pct=0.0,
+        median_oos_median_days_to_pass=0.0,
+        viable_folds=0,
+        per_fold_oos=(),
+        candidates=(),
+    )
+
+    cli._print_speed_optimization_aggregate(result)
+
+    captured = capsys.readouterr()
+    assert "Optimal Risk: n/a" in captured.out
+    assert "$0/trade" not in captured.out
+
+
+def test_cli_parser_accepts_grid_sample_and_seed() -> None:
+    args = cli.build_parser().parse_args(["--strategy", "cli_e2e_mock", "--grid-sample", "1532", "--grid-seed", "42"])
+
+    assert args.grid_sample == 1532
+    assert args.grid_seed == 42
+
+
+def test_cli_longevity_mc_printer_does_not_present_zero_risk_as_winner(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    result = LongevityOptimizationMCResult(
+        strategy="cli_e2e_mock",
+        window="holdout",
+        min_profit_per_trade=150.0,
+        min_profit_factor=1.2,
+        weights={"survival_score": 0.4, "drawdown_score": 0.2, "efficiency_score": 0.2, "capital_score": 0.2},
+        mc_iterations=10,
+        mc_block_size=5,
+        bootstrap_iterations=10,
+        optimal_risk_dollars=0.0,
+        median_longevity_score=0.0,
+        p05_longevity_score=0.0,
+        median_components={},
+        p05_components={},
+        median_avg_pnl_per_trade=0.0,
+        p05_avg_pnl_per_trade=0.0,
+        median_accounts_used=0.0,
+        median_accounts_blown=0.0,
+        candidates=(),
+    )
+
+    cli._print_longevity_optimization_mc(result)
+
+    captured = capsys.readouterr()
+    assert "Optimal Risk: n/a" in captured.out
+    assert "$0/trade" not in captured.out
+
+
+def test_cli_longevity_mc_printer_handles_rejected_candidate_rows(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    result = LongevityOptimizationMCResult(
+        strategy="cli_e2e_mock",
+        window="holdout",
+        min_profit_per_trade=150.0,
+        min_profit_factor=1.2,
+        weights={"survival_score": 0.4, "drawdown_score": 0.2, "efficiency_score": 0.2, "capital_score": 0.2},
+        mc_iterations=10,
+        mc_block_size=5,
+        bootstrap_iterations=10,
+        optimal_risk_dollars=50.0,
+        median_longevity_score=0.0,
+        p05_longevity_score=0.0,
+        median_components={},
+        p05_components={},
+        median_avg_pnl_per_trade=0.0,
+        p05_avg_pnl_per_trade=0.0,
+        median_accounts_used=0.0,
+        median_accounts_blown=0.0,
+        candidates=(
+            {
+                "risk_dollars": 50.0,
+                "rejected": True,
+                "reject_reason": "p05 avg_pnl 4.2 < 150.0",
+                "median_longevity_score": 0.0,
+            },
+        ),
+    )
+
+    cli._print_longevity_optimization_mc(result)
+
+    captured = capsys.readouterr()
+    assert "$50" in captured.out
+    assert "rejected" in captured.out
+
+
+def test_cli_result_bundle_embeds_optimizer_and_comparison_objects(
+    cli_mock_registered: None,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    holdout_trade = _sizing_trade(net_pnl=150.0)
+    speed_result = SpeedOptimizationAggregateResult(
+        strategy="cli_e2e_mock",
+        pass_floor_pct=40.0,
+        speed_target_days=10.0,
+        attempt_budget=10,
+        n_folds=2,
+        optimal_risk_dollars=100.0,
+        median_oos_utility=0.70,
+        min_oos_utility=0.50,
+        median_oos_pass_rate_pct=65.0,
+        median_oos_median_days_to_pass=8.0,
+        viable_folds=2,
+        per_fold_oos=({"fold_idx": 1, "risk_dollars": 100.0},),
+        candidates=(
+            {
+                "risk_dollars": 100.0,
+                "viable_folds": 2,
+                "median_oos_utility": 0.70,
+                "median_oos_pass_rate_pct": 65.0,
+                "median_oos_median_days_to_pass": 8.0,
+            },
+        ),
+    )
+    longevity_result = LongevityOptimizationMCResult(
+        strategy="cli_e2e_mock",
+        window="holdout",
+        min_profit_per_trade=150.0,
+        min_profit_factor=1.2,
+        weights={"survival_score": 0.4, "drawdown_score": 0.2, "efficiency_score": 0.2, "capital_score": 0.2},
+        mc_iterations=10,
+        mc_block_size=5,
+        bootstrap_iterations=10,
+        optimal_risk_dollars=150.0,
+        median_longevity_score=1.25,
+        p05_longevity_score=0.85,
+        median_components={"survival_score": 1.0, "drawdown_score": 0.8, "efficiency_score": 0.7, "capital_score": 0.6},
+        p05_components={"survival_score": 0.8, "drawdown_score": 0.6, "efficiency_score": 0.5, "capital_score": 0.4},
+        median_avg_pnl_per_trade=175.0,
+        p05_avg_pnl_per_trade=155.0,
+        median_accounts_used=1.0,
+        median_accounts_blown=0.0,
+        candidates=(
+            {
+                "risk_dollars": 150.0,
+                "rejected": False,
+                "median_longevity_score": 1.25,
+                "p05_longevity_score": 0.85,
+            },
+        ),
+    )
+    comparison_result = SizingComparisonResult(
+        strategy="cli_e2e_mock",
+        fixed_risk_dollars=200.0,
+        fixed_contracts=3,
+        track_a_optimizer={
+            "eval_track": {"risk_dollars": 100.0, "pass_rate_pct": 65.0, "median_days_to_pass": 8.0},
+            "holdout_track": {"risk_dollars": 150.0, "longevity_score": 1.25},
+        },
+        track_b_fixed_risk={
+            "risk_dollars": 200.0,
+            "eval_track": {"pass_rate_pct": 60.0, "median_days_to_pass": 10.0},
+            "holdout_track": {"longevity_score": 0.90},
+        },
+        track_c_fixed_contracts={
+            "fixed_contracts": 3,
+            "eval_track": {"pass_rate_pct": 55.0, "median_days_to_pass": 12.0},
+            "holdout_track": {"longevity_score": 0.70},
+        },
+        deltas={"fixed_risk_vs_optimizer": {"eval_pass_rate_delta": -5.0}},
+        sanity_flags=("Holdout sample size N=1 is small (< 50 trades)",),
+    )
+
+    monkeypatch.setattr(cli, "load_ohlcv", lambda **kwargs: synthetic_narrow_frame())
+    monkeypatch.setattr(
+        cli,
+        "run_walk_forward",
+        lambda *args, **kwargs: ({"width": 2.0}, [_fake_eval(window="WF1"), _fake_eval(window="WF2")], True),
+    )
+    monkeypatch.setattr(
+        cli,
+        "wf_oos_folds_for_selected_params",
+        lambda *args, **kwargs: [_fake_eval(window="WF1"), _fake_eval(window="WF2")],
+    )
+    monkeypatch.setattr(
+        cli,
+        "wf_train_test_trades_for_selected_params",
+        lambda *args, **kwargs: [([holdout_trade], [holdout_trade]), ([holdout_trade], [holdout_trade])],
+    )
+    monkeypatch.setattr(cli, "evaluate_strategy", lambda *args, **kwargs: _fake_eval(window="holdout", trade_results=[holdout_trade]))
+    monkeypatch.setattr(cli, "optimize_speed_wf_aggregate", lambda *args, **kwargs: speed_result)
+    monkeypatch.setattr(cli, "optimize_longevity_holdout_mc", lambda *args, **kwargs: longevity_result)
+    monkeypatch.setattr(cli, "run_sizing_comparison", lambda *args, **kwargs: comparison_result)
+
+    output_dir = tmp_path / "out_reporting_contract"
+    code = cli.main(
+        [
+            "--strategy", "cli_e2e_mock",
+            "--timeframe", "5min",
+            "--data-dir", str(tmp_path),
+            "--output-dir", str(output_dir),
+            "--optimize-sizing-for-speed",
+            "--optimize-sizing-for-longevity",
+            "--compare-fixed-risk", "200",
+            "--compare-fixed-contracts", "3",
+            "--holdout-mc-iterations", "10",
+            "--force",
+        ]
+    )
+
+    blob = json.loads(_cli_e2e_result_json(output_dir).read_text())
+
+    assert code == 0
+    assert blob["speed_optimization_aggregate"]["optimal_risk_dollars"] == 100.0
+    assert blob["longevity_optimization"]["optimal_risk_dollars"] == 150.0
+    assert blob["sizing_comparison"]["track_b_fixed_risk"]["risk_dollars"] == 200.0
+    assert blob["sizing"]["speed_optimization_paths"]
+    assert blob["sizing"]["longevity_optimization_path"]
 
 
 def test_full_sensitivity_trades_fn_uses_mes_instrument(
