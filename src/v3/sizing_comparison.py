@@ -21,6 +21,7 @@ from .position_sizing import (
     SpeedOptimizationAggregateResult,
     LongevityOptimizationMCResult,
     _count_sequential_eval_passes_capped,
+    _true_longevity_components_from_sim,
     _resize_trades_for_risk,
     _resize_trades_for_fixed_contracts,
 )
@@ -120,8 +121,10 @@ def run_sizing_comparison(
         resized_holdout = _resize_trades_for_risk(holdout_trades, fixed_risk_dollars, instrument, DEFAULT_MAX_CONTRACTS)
         if resized_holdout:
             holdout_sim = simulate_express_funded_resets(resized_holdout, rules_funded)
-            holdout_longevity = 1.0 + holdout_sim.accrued_pnl_bank / rules_funded.account_size
+            holdout_components = _true_longevity_components_from_sim(holdout_sim, rules_funded)
+            holdout_longevity = holdout_components["longevity_score"]
         else:
+            holdout_components = {}
             holdout_longevity = 0.0
 
         track_b_fixed_risk = {
@@ -132,6 +135,7 @@ def run_sizing_comparison(
             },
             "holdout_track": {
                 "longevity_score": holdout_longevity,
+                "bank_return_score": holdout_components.get("bank_return_score", 0.0),
                 "accounts_used": int(holdout_sim.funded_accounts_used) if resized_holdout else 0,
                 "accounts_blown": int(holdout_sim.funded_accounts_failed) if resized_holdout else 0,
             },
@@ -168,9 +172,11 @@ def run_sizing_comparison(
 
         if holdout_fixed_con:
             holdout_sim_c = simulate_express_funded_resets(holdout_fixed_con, rules_funded)
-            holdout_longevity_c = 1.0 + holdout_sim_c.accrued_pnl_bank / rules_funded.account_size
+            holdout_components_c = _true_longevity_components_from_sim(holdout_sim_c, rules_funded)
+            holdout_longevity_c = holdout_components_c["longevity_score"]
         else:
             holdout_sim_c = None
+            holdout_components_c = {}
             holdout_longevity_c = 0.0
 
         track_c_fixed_contracts = {
@@ -181,6 +187,7 @@ def run_sizing_comparison(
             },
             "holdout_track": {
                 "longevity_score": holdout_longevity_c,
+                "bank_return_score": holdout_components_c.get("bank_return_score", 0.0),
                 "accounts_used": int(holdout_sim_c.funded_accounts_used) if holdout_sim_c else 0,
                 "accounts_blown": int(holdout_sim_c.funded_accounts_failed) if holdout_sim_c else 0,
             },
@@ -194,7 +201,13 @@ def run_sizing_comparison(
 
     # Additional sanity flags
     if optimizer_speed_result.per_fold_oos:
-        viable_fold_count = len(set(p["fold_idx"] for p in optimizer_speed_result.per_fold_oos))
+        viable_fold_count = len(
+            {
+                p.get("fold_idx", p.get("fold_index"))
+                for p in optimizer_speed_result.per_fold_oos
+                if p.get("viable", True) and (p.get("fold_idx") is not None or p.get("fold_index") is not None)
+            }
+        )
         if viable_fold_count < len(fold_trade_pairs):
             sanity_flags.append(f"Optimizer chose risk viable in only {viable_fold_count}/{len(fold_trade_pairs)} folds")
 

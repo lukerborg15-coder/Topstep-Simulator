@@ -33,6 +33,32 @@ def _strip_trades(obj: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def _money(value: Any) -> str:
+    try:
+        return f"${float(value):.0f}"
+    except (TypeError, ValueError):
+        return "n/a"
+
+
+def _one_decimal(value: Any) -> str:
+    try:
+        return f"{float(value):.1f}"
+    except (TypeError, ValueError):
+        return "n/a"
+
+
+def _two_decimal(value: Any) -> str:
+    try:
+        return f"{float(value):.2f}"
+    except (TypeError, ValueError):
+        return "n/a"
+
+
+def _safe_candidates(data: dict[str, Any]) -> list[dict[str, Any]]:
+    candidates = data.get("all_candidates", data.get("candidates", []))
+    return [c for c in candidates if isinstance(c, dict)]
+
+
 def pipeline_result_bundle_to_readable_text(data: dict[str, Any]) -> str:
     """Turn a v3.cli result-bundle dict into staged human-readable ASCII blocks."""
 
@@ -50,11 +76,17 @@ def pipeline_result_bundle_to_readable_text(data: dict[str, Any]) -> str:
     # Verdict summary (if available)
     verdict_data = data.get("verdict", {})
     if isinstance(verdict_data, dict):
-        verdict = verdict_data.get("final_verdict", "UNKNOWN")
+        verdict = verdict_data.get("verdict", verdict_data.get("final_verdict", "UNKNOWN"))
         parts.append(f"VERDICT: {verdict}\n")
-        reasons = verdict_data.get("reasons", [])
-        if reasons:
-            parts.append("Reasons: " + ", ".join(str(r) for r in reasons) + "\n")
+        reject_reasons = verdict_data.get("reject_reasons", [])
+        warn_reasons = verdict_data.get("warn_reasons", [])
+        legacy_reasons = verdict_data.get("reasons", [])
+        if reject_reasons:
+            parts.append("Reject reasons: " + ", ".join(str(r) for r in reject_reasons) + "\n")
+        if warn_reasons:
+            parts.append("Warn reasons: " + ", ".join(str(r) for r in warn_reasons) + "\n")
+        if legacy_reasons and not reject_reasons and not warn_reasons:
+            parts.append("Reasons: " + ", ".join(str(r) for r in legacy_reasons) + "\n")
         parts.append("\n")
 
     # Frozen parameters
@@ -63,7 +95,7 @@ def pipeline_result_bundle_to_readable_text(data: dict[str, Any]) -> str:
     parts.append("-" * 80 + "\n")
     if "walk_forward" in data and isinstance(data["walk_forward"], dict):
         wf_data = data["walk_forward"]
-        selected_params = wf_data.get("selected_params", {})
+        selected_params = wf_data.get("best_params", wf_data.get("selected_params", {}))
         if isinstance(selected_params, dict):
             parts.append("  Strategy params:    " + "  ".join(f"{k}={v}" for k, v in list(selected_params.items())[:5]) + "\n\n")
 
@@ -71,7 +103,9 @@ def pipeline_result_bundle_to_readable_text(data: dict[str, Any]) -> str:
     if "speed_optimization_aggregate" in data:
         speed_data = data["speed_optimization_aggregate"]
         if isinstance(speed_data, dict):
-            parts.append("  >>> EVAL SIZING (speed-optimized):    ${:.0f}/trade".format(speed_data.get("optimal_risk_dollars", 0)))
+            risk = float(speed_data.get("optimal_risk_dollars") or 0.0)
+            risk_label = f"{_money(risk)}/trade" if risk > 0 else "n/a (no viable risk)"
+            parts.append(f"  >>> EVAL SIZING (speed-optimized):    {risk_label}")
             parts.append("   (X-X contracts)\n")
             parts.append("        → tied to: pass_rate, median_days_to_pass\n\n")
 
@@ -79,7 +113,9 @@ def pipeline_result_bundle_to_readable_text(data: dict[str, Any]) -> str:
     if "longevity_optimization" in data:
         long_data = data["longevity_optimization"]
         if isinstance(long_data, dict):
-            parts.append("  >>> FUNDED SIZING (longevity-optim):  ${:.0f}/trade".format(long_data.get("optimal_risk_dollars", 0)))
+            risk = float(long_data.get("optimal_risk_dollars") or 0.0)
+            risk_label = f"{_money(risk)}/trade" if risk > 0 else "n/a (no viable risk)"
+            parts.append(f"  >>> FUNDED SIZING (longevity-optim):  {risk_label}")
             parts.append("   (X-X contracts)\n")
             parts.append("        → tied to: longevity_score, accounts_used, per-account survival days\n\n")
 
@@ -90,22 +126,31 @@ def pipeline_result_bundle_to_readable_text(data: dict[str, Any]) -> str:
         parts.append("-" * 80 + "\n")
         comparison = data["sizing_comparison"]
         if isinstance(comparison, dict):
-            parts.append("  Track             Eval pass rate   Funded longevity\n")
+            parts.append("  Track             Risk                    Eval pass rate   Days   Funded longevity\n")
             if "track_a_optimizer" in comparison:
                 opt = comparison["track_a_optimizer"]
-                eval_pass = opt.get("eval_track", {}).get("pass_rate_pct", 0)
-                long_score = opt.get("holdout_track", {}).get("longevity_score", 0)
-                parts.append(f"  Optimizer         {eval_pass:6.1f}%            {long_score:.2f}\n")
+                eval_track = opt.get("eval_track", {})
+                holdout_track = opt.get("holdout_track", {})
+                eval_pass = eval_track.get("pass_rate_pct", 0)
+                long_score = holdout_track.get("longevity_score", 0)
+                risk_label = f"{_money(eval_track.get('risk_dollars'))} eval / {_money(holdout_track.get('risk_dollars'))} funded"
+                parts.append(f"  Optimizer         {risk_label:<22} {eval_pass:6.1f}%   {_one_decimal(eval_track.get('median_days_to_pass')):>5}   {long_score:.2f}\n")
             if "track_b_fixed_risk" in comparison and comparison["track_b_fixed_risk"]:
                 fixed_b = comparison["track_b_fixed_risk"]
                 eval_pass_b = fixed_b.get("eval_track", {}).get("pass_rate_pct", 0)
                 long_score_b = fixed_b.get("holdout_track", {}).get("longevity_score", 0)
-                parts.append(f"  Fixed $/trade     {eval_pass_b:6.1f}%            {long_score_b:.2f}\n")
+                risk_label = _money(fixed_b.get("risk_dollars"))
+                parts.append(f"  Fixed $/trade     {risk_label:<22} {eval_pass_b:6.1f}%   {_one_decimal(fixed_b.get('eval_track', {}).get('median_days_to_pass')):>5}   {long_score_b:.2f}\n")
             if "track_c_fixed_contracts" in comparison and comparison["track_c_fixed_contracts"]:
                 fixed_c = comparison["track_c_fixed_contracts"]
                 eval_pass_c = fixed_c.get("eval_track", {}).get("pass_rate_pct", 0)
                 long_score_c = fixed_c.get("holdout_track", {}).get("longevity_score", 0)
-                parts.append(f"  Fixed contracts   {eval_pass_c:6.1f}%            {long_score_c:.2f}\n")
+                risk_label = f"{fixed_c.get('fixed_contracts', 'n/a')} contracts"
+                parts.append(f"  Fixed contracts   {risk_label:<22} {eval_pass_c:6.1f}%   {_one_decimal(fixed_c.get('eval_track', {}).get('median_days_to_pass')):>5}   {long_score_c:.2f}\n")
+            if "deltas" in comparison and comparison["deltas"]:
+                parts.append("\n  Deltas vs optimizer:\n")
+                for name, delta in comparison["deltas"].items():
+                    parts.append(f"    - {name}: {json.dumps(delta, sort_keys=True, default=str)}\n")
             if "sanity_flags" in comparison and comparison["sanity_flags"]:
                 parts.append("\n  [SANITY FLAGS]:\n")
                 for flag in comparison["sanity_flags"]:
@@ -153,15 +198,25 @@ def pipeline_result_bundle_to_readable_text(data: dict[str, Any]) -> str:
             parts.append("-" * 80 + "\n")
             parts.append(" SPEED OPTIMIZER (aggregate winner across N folds)\n")
             parts.append("-" * 80 + "\n")
-            parts.append(f"  Winner: ${speed_data.get('optimal_risk_dollars', 0):.0f}/trade\n")
-            parts.append(f"    Median days→pass:  {speed_data.get('median_oos_median_days_to_pass', 0):.1f}\n")
-            parts.append(f"    Pass rate:         {speed_data.get('median_oos_pass_rate_pct', 0):.1f}%\n")
-            parts.append(f"    Viable in:         X/{speed_data.get('n_folds', 0)} folds\n")
-            parts.append(f"    Worst fold utility: {speed_data.get('min_oos_utility', 0):.2f}\n")
-            candidates = speed_data.get("candidates", [])
+            risk = float(speed_data.get("optimal_risk_dollars") or 0.0)
+            if risk > 0:
+                parts.append(f"  Winner: {_money(risk)}/trade\n")
+            else:
+                parts.append("  Winner: n/a (no viable risk)\n")
+            parts.append(f"    Median days→pass:  {_one_decimal(speed_data.get('median_oos_median_days_to_pass'))}\n")
+            parts.append(f"    Pass rate:         {_one_decimal(speed_data.get('median_oos_pass_rate_pct'))}%\n")
+            parts.append(f"    Viable in:         {speed_data.get('viable_folds', 0)}/{speed_data.get('n_folds', 0)} folds\n")
+            parts.append(f"    Worst fold utility: {_two_decimal(speed_data.get('min_oos_utility'))}\n")
+            candidates = _safe_candidates(speed_data)
             if candidates:
                 top_alts = candidates[:3]
-                alt_str = " | ".join(f"${c.get('risk_dollars', 0):.0f} ({c.get('median_oos_median_days_to_pass', 0):.1f}d, {c.get('median_oos_pass_rate_pct', 0):.0f}%)" for c in top_alts)
+                alt_str = " | ".join(
+                    f"{_money(c.get('risk_dollars'))} "
+                    f"({c.get('viable_folds', 'n/a')}/{speed_data.get('n_folds', 'n/a')} folds, "
+                    f"{_one_decimal(c.get('median_oos_median_days_to_pass'))}d, "
+                    f"{_one_decimal(c.get('median_oos_pass_rate_pct'))}%)"
+                    for c in top_alts
+                )
                 parts.append(f"  Top 3 alternates: {alt_str}\n\n")
 
     # Holdout summary
@@ -194,7 +249,11 @@ def pipeline_result_bundle_to_readable_text(data: dict[str, Any]) -> str:
             parts.append("-" * 80 + "\n")
             parts.append(" LONGEVITY OPTIMIZER (holdout)\n")
             parts.append("-" * 80 + "\n")
-            parts.append(f"  Winner: ${long_data.get('optimal_risk_dollars', 0):.0f}/trade\n")
+            risk = float(long_data.get("optimal_risk_dollars") or 0.0)
+            if risk > 0:
+                parts.append(f"  Winner: {_money(risk)}/trade\n")
+            else:
+                parts.append("  Winner: n/a (no viable risk)\n")
             components = long_data.get("median_components", {})
             for comp_name in ["survival_score", "drawdown_score", "efficiency_score", "capital_score"]:
                 p05_val = long_data.get("p05_components", {}).get(comp_name, 0)
@@ -215,10 +274,15 @@ def pipeline_result_bundle_to_readable_text(data: dict[str, Any]) -> str:
                     parts.append(f"    {i:>8}       {survival_days:>3}            ${balance:>9,.0f}        {result}\n")
                 parts.append("\n")
 
-            candidates = long_data.get("candidates", [])
+            candidates = _safe_candidates(long_data)
             if candidates:
                 top_alts = candidates[:3]
-                alt_str = " | ".join(f"${c.get('risk_dollars', 0):.0f} ({c.get('median_longevity_score', 0):.2f})" for c in top_alts)
+                alt_bits = []
+                for c in top_alts:
+                    reason = c.get("reject_reason")
+                    status = f"rejected: {reason}" if reason else f"score={_two_decimal(c.get('median_longevity_score'))}"
+                    alt_bits.append(f"{_money(c.get('risk_dollars'))} ({status})")
+                alt_str = " | ".join(alt_bits)
                 parts.append(f"  Top 3 alternates: {alt_str}\n\n")
 
     # Supporting artifacts

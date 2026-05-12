@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import random
 from dataclasses import dataclass
+from itertools import islice, product
 from typing import Any
 
 import numpy as np
@@ -51,6 +53,46 @@ def _contracts_for_fixed_risk(
     if n <= 0:
         return 0
     return min(max_contracts, n)
+
+
+def _grid_candidate_from_index(
+    default_params: dict[str, Any],
+    keys: list[str],
+    values: list[tuple[Any, ...]],
+    index: int,
+) -> dict[str, Any]:
+    combo_reversed: list[Any] = []
+    for choices in reversed(values):
+        index, offset = divmod(index, len(choices))
+        combo_reversed.append(choices[offset])
+    combo = list(reversed(combo_reversed))
+    return {**default_params, **dict(zip(keys, combo, strict=True))}
+
+
+def _strategy_candidates(
+    spec: Any,
+    *,
+    max_grid: int | None,
+    grid_sample: int | None,
+    grid_seed: int,
+) -> list[dict[str, Any]]:
+    if not spec.param_grid:
+        return [dict(spec.default_params)]
+
+    keys = list(spec.param_grid)
+    values = [tuple(spec.param_grid[key]) for key in keys]
+    total = 1
+    for choices in values:
+        total *= len(choices)
+
+    limit = min(total, max_grid) if max_grid is not None else total
+    if grid_sample is not None:
+        sample_size = min(grid_sample, limit)
+        indexes = sorted(random.Random(grid_seed).sample(range(limit), sample_size))
+        return [_grid_candidate_from_index(spec.default_params, keys, values, idx) for idx in indexes]
+
+    combos = islice(product(*values), limit)
+    return [{**spec.default_params, **dict(zip(keys, combo, strict=True))} for combo in combos]
 
 
 def simulate_trades(
@@ -279,15 +321,17 @@ def run_walk_forward(
     instrument: Instrument = MNQ,
     risk_dollars: float = DEFAULT_RISK_DOLLARS,
     max_contracts: int | None = None,
+    grid_sample: int | None = None,
+    grid_seed: int = 42,
 ) -> tuple[dict[str, Any], list[EvaluationResult], bool]:
     spec = STRATEGIES[strategy_name]
-    candidates = spec.grid()
     if max_grid is not None and max_grid <= 0:
         raise ValueError("max_grid must be positive when provided")
+    if grid_sample is not None and grid_sample <= 0:
+        raise ValueError("grid_sample must be positive when provided")
     if min_eval_passes_per_fold < 1:
         raise ValueError("min_eval_passes_per_fold must be at least 1")
-    if max_grid is not None:
-        candidates = candidates[:max_grid]
+    candidates = _strategy_candidates(spec, max_grid=max_grid, grid_sample=grid_sample, grid_seed=grid_seed)
     if not candidates:
         raise ValueError(f"No parameter candidates available for strategy {strategy_name!r}")
 

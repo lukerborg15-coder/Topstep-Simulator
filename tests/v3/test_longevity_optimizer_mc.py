@@ -167,3 +167,85 @@ def test_optimize_longevity_holdout_mc_weights():
 
     if result.optimal_risk_dollars > 0.0:
         assert result.weights == custom_weights
+
+
+def test_optimize_longevity_holdout_mc_has_no_hard_gates_for_candidate_ranking():
+    trades = [_make_trade(i, 50.0) for i in range(1, 16)]
+
+    result = optimize_longevity_holdout_mc(
+        trades,
+        "test_strategy",
+        risk_levels=[50.0, 100.0],
+        min_profit_per_trade=10_000.0,
+        min_profit_factor=10.0,
+        mc_iterations=20,
+        bootstrap_iterations=20,
+    )
+
+    assert result.optimal_risk_dollars in {50.0, 100.0}
+    assert result.candidates
+    assert all(not candidate.get("rejected", False) for candidate in result.candidates)
+    assert all("p05_longevity_score" in candidate for candidate in result.candidates)
+
+
+def test_optimize_longevity_holdout_mc_ranks_by_true_longevity_not_raw_bank_return(monkeypatch):
+    trades = [_make_trade(i, 100.0) for i in range(1, 8)]
+
+    monkeypatch.setattr(
+        "v3.position_sizing._get_valid_risk_levels",
+        lambda trades, risk_levels, instrument, coverage_threshold=0.5: risk_levels,
+    )
+
+    class FakeSim:
+        def __init__(self, risk):
+            values = {
+                100.0: {
+                    "bank": 5_000.0,
+                    "accounts_used": 1,
+                    "accounts_failed": 0,
+                    "worst_drawdown": 500.0,
+                },
+                300.0: {
+                    "bank": 20_000.0,
+                    "accounts_used": 5,
+                    "accounts_failed": 4,
+                    "worst_drawdown": 1_500.0,
+                },
+            }[risk]
+            self.accrued_pnl_bank = values["bank"]
+            self.funded_accounts_used = values["accounts_used"]
+            self.funded_accounts_failed = values["accounts_failed"]
+            self.worst_stint_peak_to_trough_drawdown_from_peak_balance = values["worst_drawdown"]
+            self.stints_summary = tuple(
+                {
+                    "survival_days": int(risk),
+                    "trades_applied_count": 10,
+                }
+                for _ in range(values["accounts_used"])
+            )
+
+    current_risk = {"value": 100.0}
+
+    def fake_resize(trades, risk, instrument, max_contracts=50):
+        current_risk["value"] = risk
+        return trades
+
+    def fake_simulate(trades, rules):
+        return FakeSim(current_risk["value"])
+
+    monkeypatch.setattr("v3.position_sizing._resize_trades_for_risk", fake_resize)
+    monkeypatch.setattr("v3.position_sizing.simulate_express_funded_resets", fake_simulate)
+
+    result = optimize_longevity_holdout_mc(
+        trades,
+        "test_strategy",
+        risk_levels=[100.0, 300.0],
+        mc_iterations=2,
+        bootstrap_iterations=2,
+    )
+
+    by_risk = {candidate["risk_dollars"]: candidate for candidate in result.candidates}
+
+    assert by_risk[300.0]["comparison_longevity_score"] > by_risk[100.0]["comparison_longevity_score"]
+    assert by_risk[100.0]["median_longevity_score"] > by_risk[300.0]["median_longevity_score"]
+    assert result.optimal_risk_dollars == 100.0

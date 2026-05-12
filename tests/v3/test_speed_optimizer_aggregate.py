@@ -5,6 +5,7 @@ from __future__ import annotations
 import pandas as pd
 import pytest
 
+import v3.position_sizing as position_sizing
 from v3.position_sizing import (
     optimize_speed_wf_aggregate,
     _count_sequential_eval_passes_capped,
@@ -122,3 +123,43 @@ def test_optimize_speed_wf_aggregate_min_viable_folds():
     # Result should either find a winner in 2+ folds or return empty
     if result.optimal_risk_dollars > 0.0:
         assert len([p for p in result.per_fold_oos if p.get("risk_dollars") == result.optimal_risk_dollars]) >= 2
+
+
+def test_optimize_speed_wf_aggregate_reports_best_measured_risk_when_no_survivors(monkeypatch):
+    fold_pairs = [
+        ([_make_trade(i, -100.0) for i in range(1, 5)], [_make_trade(i, -50.0) for i in range(5, 8)]),
+        ([_make_trade(i, -100.0) for i in range(10, 14)], [_make_trade(i, -50.0) for i in range(14, 17)]),
+    ]
+
+    def fake_evaluate_risk_on_trades(trades, risk, rules, attempt_budget, instrument):
+        if risk == 300.0:
+            return {
+                "pass_rate_pct": 25.0,
+                "median_days_to_pass": 12.0,
+                "utility": 0.0,
+                "min_contracts": 1,
+                "max_contracts": 1,
+            }
+        return {
+            "pass_rate_pct": 0.0,
+            "median_days_to_pass": float("inf"),
+            "utility": 0.0,
+            "min_contracts": 1,
+            "max_contracts": 1,
+        }
+
+    monkeypatch.setattr(position_sizing, "_get_valid_risk_levels", lambda trades, risks, instrument, coverage_threshold=0.5: risks)
+    monkeypatch.setattr(position_sizing, "_evaluate_risk_on_trades", fake_evaluate_risk_on_trades)
+
+    result = optimize_speed_wf_aggregate(
+        fold_pairs,
+        "test_strategy",
+        risk_levels=[50.0, 300.0],
+        pass_floor_pct=99.0,
+        min_viable_folds=2,
+    )
+
+    assert result.optimal_risk_dollars == 300.0
+    assert result.median_oos_pass_rate_pct == 25.0
+    assert result.viable_folds == 0
+    assert result.candidates
