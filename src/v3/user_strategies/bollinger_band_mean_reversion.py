@@ -4,7 +4,7 @@ Multi-timeframe strategy using:
 - HTF RSI for trend direction
 - HTF ADX for trend strength
 - LTF ADX for entry confirmation
-- LTF Supertrend for entries
+- HTF Supertrend for trend confirmation
 - LTF Bollinger Bands for mean reversion targets/exits
 """
 
@@ -100,7 +100,7 @@ def bollinger_band_mean_reversion_generate(df: pd.DataFrame, params: dict) -> li
     
     ltf_df = df.copy()  # Primary is already LTF
 
-    if len(htf_df) < max(htf_rsi_period, htf_adx_period, bb_period) + 1:
+    if len(htf_df) < max(htf_rsi_period, htf_adx_period, supertrend_period) + 1:
         return []
 
     # HTF indicators
@@ -111,10 +111,10 @@ def bollinger_band_mean_reversion_generate(df: pd.DataFrame, params: dict) -> li
     ltf_adx_series = adx(ltf_df, ltf_adx_period)
     ltf_atr_series = atr(ltf_df, atr_period)
 
-    # Supertrend
-    st_data = supertrend(ltf_df, supertrend_period, supertrend_mult)
-    ltf_st = st_data["st"]
-    ltf_st_dir = st_data["dir"]
+    # Supertrend on HTF (regime filter), reindexed to LTF
+    htf_st_data = supertrend(htf_df, supertrend_period, supertrend_mult)
+    htf_st_reindexed = htf_st_data["st"].reindex(ltf_df.index, method="ffill")
+    htf_st_dir_reindexed = htf_st_data["dir"].reindex(ltf_df.index, method="ffill")
 
     # Bollinger Bands on LTF
     bb_mid = ltf_df["close"].rolling(bb_period, min_periods=bb_period).mean()
@@ -144,18 +144,17 @@ def bollinger_band_mean_reversion_generate(df: pd.DataFrame, params: dict) -> li
         htf_rsi = htf_rsi_reindexed.iloc[i]
         htf_adx = htf_adx_reindexed.iloc[i]
         ltf_adx = ltf_adx_series.iloc[i]
-        ltf_st_val = ltf_st.iloc[i]
-        st_dir = int(ltf_st_dir.iloc[i])
+        htf_st_val = htf_st_reindexed.iloc[i]
+        st_dir = int(htf_st_dir_reindexed.iloc[i])
         a = ltf_atr_series.iloc[i]
 
         # Check for finite values
-        if not all(np.isfinite(x) for x in [htf_rsi, htf_adx, ltf_adx, ltf_st_val, a]):
+        if not all(np.isfinite(x) for x in [htf_rsi, htf_adx, ltf_adx, htf_st_val, a]):
             continue
 
         if a <= 0:
             continue
 
-        entry_price = float(ltf_df["close"].iloc[i])
         bb_u = bb_upper.iloc[i]
         bb_l = bb_lower.iloc[i]
         bb_m = bb_mid.iloc[i]
@@ -163,32 +162,42 @@ def bollinger_band_mean_reversion_generate(df: pd.DataFrame, params: dict) -> li
         if not np.isfinite(bb_u) or not np.isfinite(bb_l):
             continue
 
+        ltf_low = ltf_df["low"].iloc[i]
+        ltf_high = ltf_df["high"].iloc[i]
+
         direction = 0
+        entry_price = 0.0
         stop_price = 0.0
         target_price = 0.0
 
-        # Long conditions: HTF RSI above threshold, HTF ADX above threshold, LTF ADX confirms, Supertrend bullish
+        # Long: HTF filters bullish AND bar's low wicks to/through the lower band.
+        # Fill at the exact band value (bb_l), not the bar's close.
         if (
             htf_rsi >= htf_rsi_long
             and htf_adx >= htf_adx_thresh
             and ltf_adx >= ltf_adx_thresh
             and st_dir == 1
+            and ltf_low <= bb_l
         ):
             direction = 1
+            entry_price = float(bb_l)
             stop_price = entry_price - stop_atr_mult * a
             if exit_mode == "bb_band_tp":
                 target_price = bb_u
             else:  # fixed_rr
                 target_price = entry_price + rr_mult * (entry_price - stop_price)
 
-        # Short conditions: HTF RSI below threshold, HTF ADX above threshold, LTF ADX confirms, Supertrend bearish
+        # Short: HTF filters bearish AND bar's high wicks to/through the upper band.
+        # Fill at the exact band value (bb_u), not the bar's close.
         elif (
             htf_rsi <= htf_rsi_short
             and htf_adx >= htf_adx_thresh
             and ltf_adx >= ltf_adx_thresh
             and st_dir == -1
+            and ltf_high >= bb_u
         ):
             direction = -1
+            entry_price = float(bb_u)
             stop_price = entry_price + stop_atr_mult * a
             if exit_mode == "bb_band_tp":
                 target_price = bb_l
